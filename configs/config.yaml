@@ -1,0 +1,33 @@
+# 个学（GeXue）配置
+# 环境变量优先级高于本文件；大模型配置与 ~/ww/mianba/backend/config.py 对齐
+server:
+  port: 8080
+
+db:
+  dsn: "postgres://gexue:gexue@localhost:5432/gexue?sslmode=disable"
+
+llm:
+  ark_api_key: ${ARK_API_KEY}
+  ark_base_url: https://ark.cn-beijing.volces.com/api/v3
+  ark_model: deepseek-v3-2-251201
+  deepseek_v4_api_key: ${DEEPSEEK_V4_API_KEY}
+  deepseek_v4_base_url: https://api.deepseek.com
+  deepseek_v4_model: deepseek-v4-flash
+  dashscope_api_key: ${DASHSCOPE_API_KEY}
+  dashscope_base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+
+embedding:
+  provider: dashscope
+  model: text-embedding-v3
+  dim: 512
+
+auth:
+  jwt_secret: ${JWT_SECRET_KEY}
+  token_ttl_hours: 168
+
+chunk:
+  max_chunk: 500
+  overlap: 60
+
+log:
+  level: debug
