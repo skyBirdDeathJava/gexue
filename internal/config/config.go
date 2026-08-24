@@ -5,18 +5,22 @@ package config
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/spf13/viper"
 )
 
 type Config struct {
-	Server    Server
-	DB        DB
-	LLM       LLM
-	Embedding Embedding
-	Auth      Auth
-	Chunk     Chunk
-	Log       Log
+	Server     Server
+	DB         DB
+	LLM        LLM
+	Embedding  Embedding
+	Auth       Auth
+	Chunk      Chunk
+	Log        Log
+	OSS        OSS
+	VolcEngine VolcEngine
+	AliyunSMS  AliyunSMS
 }
 
 type Server struct {
@@ -65,6 +69,29 @@ type Log struct {
 	Level string
 }
 
+// OSS 阿里云对象存储配置（与 mianba config.py 对齐）
+type OSS struct {
+	AccessKeyID     string `mapstructure:"access_key_id"`
+	AccessKeySecret string `mapstructure:"access_key_secret"`
+	Bucket          string
+	Endpoint        string
+	AccelEndpoint   string `mapstructure:"accel_endpoint"`
+}
+
+// VolcEngine 火山引擎视觉服务配置（用于 OCR）
+type VolcEngine struct {
+	VisualAK string `mapstructure:"visual_ak"`
+	VisualSK string `mapstructure:"visual_sk"`
+}
+
+// AliyunSMS 阿里云短信配置（可选；留空则用开发模式）
+type AliyunSMS struct {
+	AccessKeyID     string `mapstructure:"access_key_id"`
+	AccessKeySecret string `mapstructure:"access_key_secret"`
+	SignName        string `mapstructure:"sign_name"`
+	TemplateCode    string `mapstructure:"template_code"`
+}
+
 func Load(path string) (*Config, error) {
 	v := viper.New()
 	v.SetConfigFile(path)
@@ -72,18 +99,11 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("read config %s: %w", path, err)
 	}
 
-	// 环境变量注入（与 mianba config.py 同名）
-	bindEnv(v, "llm.ark_api_key", "ARK_API_KEY")
-	bindEnv(v, "llm.deepseek_v4_api_key", "DEEPSEEK_V4_API_KEY")
-	bindEnv(v, "llm.dashscope_api_key", "DASHSCOPE_API_KEY")
-	bindEnv(v, "embedding.api_key", "DASHSCOPE_API_KEY")
-	bindEnv(v, "auth.jwt_secret", "JWT_SECRET_KEY")
-	bindEnv(v, "db.dsn", "DB_DSN")
-
 	var cfg Config
 	if err := v.Unmarshal(&cfg); err != nil {
 		return nil, fmt.Errorf("unmarshal config: %w", err)
 	}
+
 	// 默认值兜底
 	if cfg.Server.Port == 0 {
 		cfg.Server.Port = 8080
@@ -100,9 +120,66 @@ func Load(path string) (*Config, error) {
 	if cfg.Chunk.Overlap == 0 {
 		cfg.Chunk.Overlap = 60
 	}
+
+	// 环境变量覆盖（优先级高于配置文件）
+	overrideFromEnv(&cfg)
+
 	return &cfg, nil
 }
 
+// overrideFromEnv 使用环境变量覆盖配置
+func overrideFromEnv(cfg *Config) {
+	if v := os.Getenv("ARK_API_KEY"); v != "" {
+		cfg.LLM.ARKAPIKey = v
+	}
+	if v := os.Getenv("DEEPSEEK_V4_API_KEY"); v != "" {
+		cfg.LLM.DeepSeekV4APIKey = v
+	}
+	if v := os.Getenv("DASHSCOPE_API_KEY"); v != "" {
+		cfg.LLM.DashScopeAPIKey = v
+		cfg.Embedding.APIKey = v
+	}
+	if v := os.Getenv("JWT_SECRET_KEY"); v != "" {
+		cfg.Auth.JWTSecret = v
+	}
+	if v := os.Getenv("DB_DSN"); v != "" {
+		cfg.DB.DSN = v
+	}
+	if v := os.Getenv("OSS_ACCESS_KEY_ID"); v != "" {
+		cfg.OSS.AccessKeyID = v
+	}
+	if v := os.Getenv("OSS_ACCESS_KEY_SECRET"); v != "" {
+		cfg.OSS.AccessKeySecret = v
+	}
+	if v := os.Getenv("OSS_BUCKET"); v != "" {
+		cfg.OSS.Bucket = v
+	}
+	if v := os.Getenv("OSS_ENDPOINT"); v != "" {
+		cfg.OSS.Endpoint = v
+	}
+	if v := os.Getenv("OSS_ACCEL_ENDPOINT"); v != "" {
+		cfg.OSS.AccelEndpoint = v
+	}
+	if v := os.Getenv("VOLCENGINE_VISUAL_AK"); v != "" {
+		cfg.VolcEngine.VisualAK = v
+	}
+	if v := os.Getenv("VOLCENGINE_VISUAL_SK"); v != "" {
+		cfg.VolcEngine.VisualSK = v
+	}
+	// 阿里云短信配置
+	if v := os.Getenv("ALIYUN_ACCESS_KEY_ID"); v != "" {
+		cfg.AliyunSMS.AccessKeyID = v
+	}
+	if v := os.Getenv("ALIYUN_ACCESS_KEY_SECRET"); v != "" {
+		cfg.AliyunSMS.AccessKeySecret = v
+	}
+	if v := os.Getenv("ALIYUN_SMS_SIGN_NAME"); v != "" {
+		cfg.AliyunSMS.SignName = v
+	}
+	if v := os.Getenv("ALIYUN_SMS_TEMPLATE_CODE"); v != "" {
+		cfg.AliyunSMS.TemplateCode = v
+	}
+}
 func bindEnv(v *viper.Viper, key, env string) {
 	_ = v.BindEnv(key, env)
 }

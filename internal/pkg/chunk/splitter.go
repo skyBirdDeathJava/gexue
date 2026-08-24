@@ -8,6 +8,7 @@ import (
 
 // Split 按句子边界切分文本，带 overlap。
 // 短内容（≤ maxChunk）整条返回；单句超长按 maxChunk 硬切并保 overlap。
+// 注：maxChunk 和 overlap 单位为字符数（不是字节数）
 func Split(text string, maxChunk, overlap int) []string {
 	text = strings.TrimSpace(text)
 	if text == "" {
@@ -23,7 +24,8 @@ func Split(text string, maxChunk, overlap int) []string {
 		overlap = maxChunk / 4
 	}
 
-	if len([]rune(text)) <= maxChunk {
+	runes := []rune(text)
+	if len(runes) <= maxChunk {
 		return []string{text}
 	}
 
