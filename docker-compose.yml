@@ -1,23 +1,28 @@
-# 个学（GeXue）本地依赖编排
-# 当前仅 PostgreSQL+pgvector；后端/前端服务随 M0/S1 骨架逐步加入
+version: '3.9'
+
 services:
   postgres:
-    image: pgvector/pgvector:pg18        # 内置 vector 扩展
-    container_name: gexue-postgres
+    image: pgvector/pgvector:pg18-latest
     environment:
       POSTGRES_USER: gexue
-      POSTGRES_PASSWORD: gexue
+      POSTGRES_PASSWORD: gexue_password
       POSTGRES_DB: gexue
     ports:
       - "5432:5432"
     volumes:
-      # PG 18+ 镜像约定：挂载父目录，数据落在子目录（避免 mount 边界问题）
-      - gexue_pgdata:/var/lib/postgresql
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - gexue-network
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U gexue"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
 volumes:
-  gexue_pgdata:
+  postgres_data:
+
+networks:
+  gexue-network:
+    driver: bridge

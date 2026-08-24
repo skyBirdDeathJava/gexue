@@ -14,6 +14,10 @@ docs/
 *.test
 *.out
 coverage.*
+/gexue
+
+# ---------- 残留 demo/初始化脚本（与正式 SCHEMA.sql/init-db.sh 重复） ----------
+/init.sql
 
 # ---------- 前端（如后续纳入本仓库） ----------
 node_modules/

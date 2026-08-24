@@ -2,19 +2,28 @@ package service
 
 import (
 	"context"
+	"os"
+	"regexp"
+	"strings"
 
 	"github.com/pgvector/pgvector-go"
+	"go.uber.org/zap"
 
 	"gexue/internal/embedding"
 	"gexue/internal/model"
 	"gexue/internal/pkg/chunk"
+	"gexue/internal/pkg/document"
+	"gexue/internal/pkg/volcengine"
 	"gexue/internal/repo"
 )
 
 // KnowledgeService 知识库编排。
 type KnowledgeService struct {
-	repo *repo.KnowledgeRepo
-	emb  embedding.Embedder
+	repo      *repo.KnowledgeRepo
+	emb       embedding.Embedder
+	ossUpload func(objectKey, filePath string) (string, error) // OSS 上传函数
+	ocrClient *volcengine.OCRClient                            // 火山引擎 OCR 客户端
+	logger    *zap.Logger                                      // 日志记录器
 	// 分块参数（config chunk 段）
 	maxChunk int
 	overlap  int
@@ -27,17 +36,28 @@ func NewKnowledgeService(r *repo.KnowledgeRepo, e embedding.Embedder, maxChunk, 
 	if overlap <= 0 {
 		overlap = 60
 	}
-	return &KnowledgeService{repo: r, emb: e, maxChunk: maxChunk, overlap: overlap}
+	logger, _ := zap.NewProduction()
+	return &KnowledgeService{repo: r, emb: e, maxChunk: maxChunk, overlap: overlap, logger: logger}
 }
 
-// CreateBase 创建知识库（年级+学科维度）。
+// SetOSSUpload 注入 OSS 上传函数
+func (s *KnowledgeService) SetOSSUpload(fn func(objectKey, filePath string) (string, error)) {
+	s.ossUpload = fn
+}
+
+// SetOCRClient 注入火山引擎 OCR 客户端
+func (s *KnowledgeService) SetOCRClient(client *volcengine.OCRClient) {
+	s.ocrClient = client
+}
+
+// CreateBase 创建知识库（年级+学科维度）
 func (s *KnowledgeService) CreateBase(ctx context.Context, userID uint, name string, subjectID, gradeID uint, desc string) (*model.KnowledgeBase, error) {
 	kb := &model.KnowledgeBase{
-		UserID:    userID,
-		Name:      name,
-		SubjectID: subjectID,
-		GradeID:   gradeID,
-		Desc:      desc,
+		UserID:      userID,
+		Name:        name,
+		SubjectID:   subjectID,
+		GradeID:     gradeID,
+		Description: desc,
 	}
 	if err := s.repo.CreateBase(ctx, kb); err != nil {
 		return nil, err
@@ -45,19 +65,8 @@ func (s *KnowledgeService) CreateBase(ctx context.Context, userID uint, name str
 	return kb, nil
 }
 
-// CreatePoint 在知识库下建知识点（parent_id<=0 视为根节点，存 NULL）。
-func (s *KnowledgeService) CreatePoint(ctx context.Context, kbID uint, code, name string, parentID *uint) (*model.KnowledgePoint, error) {
-	if parentID != nil && *parentID == 0 {
-		parentID = nil // 根节点：无父
-	}
-	kp := &model.KnowledgePoint{KbID: kbID, Code: code, Name: name, ParentID: parentID}
-	if err := s.repo.CreatePoint(ctx, kp); err != nil {
-		return nil, err
-	}
-	return kp, nil
-}
-
-// CreateChunks 录入：校验 KB 归属 → 分块 → 向量化 → 入库。
+// CreateChunks 录入：校验 KB 归属 → 分块 → 向量化 → 入库（旧 API，保留兼容）。
+// Deprecated: 使用 CreateChunksFromFile 替代，用户无需手动指定知识点。
 func (s *KnowledgeService) CreateChunks(ctx context.Context, userID, kbID, kpID uint, content, source string) ([]model.KnowledgeChunk, error) {
 	if _, err := s.repo.GetBase(ctx, userID, kbID); err != nil {
 		return nil, err
@@ -77,7 +86,6 @@ func (s *KnowledgeService) CreateChunks(ctx context.Context, userID, kbID, kpID 
 	for i, p := range parts {
 		chunks = append(chunks, model.KnowledgeChunk{
 			KbID:        kbID,
-			KpID:        kpID,
 			Seq:         i,
 			ContentText: p,
 			ContentVec:  pgvector.NewVector(vecs[i]),
@@ -90,12 +98,133 @@ func (s *KnowledgeService) CreateChunks(ctx context.Context, userID, kbID, kpID 
 	return chunks, nil
 }
 
-// ListBases 我的知识库列表。
+// CreateChunksFromFile 从文件上传：
+// 1. 原始文件上传到 OSS
+// 2. 提取文本 → 分块 → 向量化
+// 3. 所有分块关联原文件的 OSS URL 入库
+// filePath: 临时文件路径，fileName: 原始文件名
+func (s *KnowledgeService) CreateChunksFromFile(ctx context.Context, userID, kbID uint, filePath, fileName string) ([]model.KnowledgeChunk, error) {
+	// 1. 验证知识库权限
+	if _, err := s.repo.GetBase(ctx, userID, kbID); err != nil {
+		return nil, err
+	}
+
+	// 2. 上传原始文件到 OSS（如果配置了 OSS）
+	var ossURL string
+	if s.ossUpload != nil {
+		var err error
+		objectKey := fileName // 使用原始文件名作为对象键前缀
+		ossURL, err = s.ossUpload(objectKey, filePath)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// 3. 提取文本
+	text, err := document.ExtractTextWithOCRClient(ctx, filePath, s.ocrClient)
+	if err != nil {
+		return nil, err
+	}
+
+	textRunes := []rune(text)
+	s.logger.Info("OCR 文本提取完成",
+		zap.String("file", fileName),
+		zap.Int("char_count", len(textRunes)),
+		zap.Int("byte_length", len(text)),
+		zap.String("first_500_chars", truncate(text, 500)))
+
+	// 标准化文本：移除多余换行，节省 token
+	originalLen := len(textRunes)
+	text = normalizeText(text)
+	normalizedLen := len([]rune(text))
+
+	s.logger.Info("文本标准化完成",
+		zap.String("file", fileName),
+		zap.Int("original_chars", originalLen),
+		zap.Int("normalized_chars", normalizedLen),
+		zap.Int("chars_saved", originalLen-normalizedLen))
+
+	// 4. 分块
+	parts := chunk.Split(text, s.maxChunk, s.overlap)
+	if len(parts) == 0 {
+		return nil, nil
+	}
+
+	s.logger.Info("文本分块完成",
+		zap.String("file", fileName),
+		zap.Int("chunk_count", len(parts)),
+		zap.Int("max_chunk", s.maxChunk),
+		zap.Int("overlap", s.overlap))
+
+	// 打印前几个分块用于调试
+	for i := 0; i < len(parts) && i < 3; i++ {
+		s.logger.Debug("分块详情",
+			zap.Int("chunk_index", i),
+			zap.Int("chunk_length", len(parts[i])),
+			zap.String("content_preview", truncate(parts[i], 200)))
+	}
+
+	// 5. 向量化
+	vecs, err := s.emb.Embed(ctx, parts)
+	if err != nil {
+		return nil, err
+	}
+
+	var fileSize int64
+	if info, statErr := os.Stat(filePath); statErr == nil {
+		fileSize = info.Size()
+	}
+
+	// 6. 创建分块对象（所有分块关联同一个原文件的 OSS URL）
+	chunks := make([]model.KnowledgeChunk, 0, len(parts))
+	for i, p := range parts {
+		chunks = append(chunks, model.KnowledgeChunk{
+			KbID:        kbID,
+			Seq:         i,
+			ContentText: p,                           // 分块后的文本内容
+			ContentVec:  pgvector.NewVector(vecs[i]), // 向量化的分块
+			Source:      "upload",
+			FileName:    fileName, // 原始文件名
+			FileSize:    fileSize,
+			OSSUrl:      ossURL, // 原始文件的 OSS URL（所有分块相同）
+		})
+	}
+
+	// 7. 入库
+	if err := s.repo.SaveChunks(ctx, chunks); err != nil {
+		return nil, err
+	}
+
+	return chunks, nil
+}
+
+// GetBase 知识库详情（含年级/学科）。
+func (s *KnowledgeService) GetBase(ctx context.Context, userID, kbID uint) (*model.KnowledgeBase, error) {
+	return s.repo.GetBaseWithMeta(ctx, userID, kbID)
+}
+
+// ListFiles 知识库下已入库文档。
+func (s *KnowledgeService) ListFiles(ctx context.Context, userID, kbID uint) ([]model.KnowledgeFile, error) {
+	if _, err := s.repo.GetBase(ctx, userID, kbID); err != nil {
+		return nil, err
+	}
+	return s.repo.ListFiles(ctx, kbID)
+}
+
+// DeleteFile 删除某文档的全部分块。
+func (s *KnowledgeService) DeleteFile(ctx context.Context, userID, kbID uint, fileName string) error {
+	if _, err := s.repo.GetBase(ctx, userID, kbID); err != nil {
+		return err
+	}
+	return s.repo.DeleteChunksByFile(ctx, kbID, fileName)
+}
+
+// ListBases 我的知识库列表
 func (s *KnowledgeService) ListBases(ctx context.Context, userID uint) ([]model.KnowledgeBase, error) {
 	return s.repo.ListBases(ctx, userID)
 }
 
-// ListMeta 年级+学科元数据（建库下拉）。
+// ListMeta 年级+学科元数据（建库下拉）
 func (s *KnowledgeService) ListMeta(ctx context.Context) ([]model.Grade, []model.Subject, error) {
 	grades, err := s.repo.ListGrades(ctx)
 	if err != nil {
@@ -108,80 +237,12 @@ func (s *KnowledgeService) ListMeta(ctx context.Context) ([]model.Grade, []model
 	return grades, subjects, nil
 }
 
-// DeleteBase 删除知识库（级联）。
+// DeleteBase 删除知识库（级联）
 func (s *KnowledgeService) DeleteBase(ctx context.Context, userID, kbID uint) error {
 	return s.repo.DeleteBase(ctx, userID, kbID)
 }
 
-// ListPointTree 知识库下知识点树（扁平 → 树）。
-func (s *KnowledgeService) ListPointTree(ctx context.Context, userID, kbID uint) ([]model.KnowledgePoint, error) {
-	if _, err := s.repo.GetBase(ctx, userID, kbID); err != nil {
-		return nil, err
-	}
-	points, err := s.repo.ListPoints(ctx, kbID)
-	if err != nil {
-		return nil, err
-	}
-	return buildTree(points), nil
-}
-
-// buildTree 依据 ParentID 组装树（parent_id 为空为根）。
-// 自顶向下递归挂载：从根开始逐层 attach，避免"先拷贝子节点、后补孙节点"的时序丢失。
-func buildTree(points []model.KnowledgePoint) []model.KnowledgePoint {
-	byID := make(map[uint]model.KnowledgePoint, len(points))
-	children := make(map[uint][]uint) // parentID -> 子ID
-	for _, p := range points {
-		p.Children = nil
-		byID[p.ID] = p
-		if p.ParentID != nil {
-			children[*p.ParentID] = append(children[*p.ParentID], p.ID)
-		}
-	}
-	var attach func(id uint) model.KnowledgePoint
-	attach = func(id uint) model.KnowledgePoint {
-		p := byID[id]
-		for _, cid := range children[id] {
-			p.Children = append(p.Children, attach(cid))
-		}
-		return p
-	}
-	var roots []model.KnowledgePoint
-	for _, p := range byID {
-		// 根：无父，或父不在本知识库（孤儿兜底为根）
-		if p.ParentID == nil {
-			roots = append(roots, attach(p.ID))
-		} else if _, ok := byID[*p.ParentID]; !ok {
-			roots = append(roots, attach(p.ID))
-		}
-	}
-	return roots
-}
-
-// ListPointChunks 某知识点下的分块列表。
-func (s *KnowledgeService) ListPointChunks(ctx context.Context, userID, kbID, kpID uint) ([]model.KnowledgeChunk, error) {
-	if _, err := s.repo.GetBase(ctx, userID, kbID); err != nil {
-		return nil, err
-	}
-	return s.repo.ListChunksByPoint(ctx, kpID)
-}
-
-// DeleteChunk 删除分块（分块须属于该知识点）。
-func (s *KnowledgeService) DeleteChunk(ctx context.Context, userID, kbID, kpID, chunkID uint) error {
-	if _, err := s.repo.GetBase(ctx, userID, kbID); err != nil {
-		return err
-	}
-	return s.repo.DeleteChunk(ctx, kbID, kpID, chunkID)
-}
-
-// DeletePoint 删除知识点（级联分块）。
-func (s *KnowledgeService) DeletePoint(ctx context.Context, userID, kbID, kpID uint) error {
-	if _, err := s.repo.GetBase(ctx, userID, kbID); err != nil {
-		return err
-	}
-	return s.repo.DeletePoint(ctx, kbID, kpID)
-}
-
-// SearchInKb 库内语义检索（出题/回忆用）。
+// SearchInKb 库内语义检索（出题/回忆用）
 func (s *KnowledgeService) SearchInKb(ctx context.Context, userID, kbID uint, query string, topK int) ([]model.KnowledgeChunk, error) {
 	if _, err := s.repo.GetBase(ctx, userID, kbID); err != nil {
 		return nil, err
@@ -191,4 +252,38 @@ func (s *KnowledgeService) SearchInKb(ctx context.Context, userID, kbID uint, qu
 		return nil, err
 	}
 	return s.repo.SearchInKb(ctx, kbID, pgvector.NewVector(vecs[0]), topK)
+}
+
+// truncate 截断字符串用于日志打印
+func truncate(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}
+
+// normalizeText 标准化文本：移除多余换行，节省存储和 token
+// 处理规则：
+// 1. 多个连续换行替换为单个换行
+// 2. 移除行尾空白
+// 3. 移除纯空白行
+func normalizeText(text string) string {
+	// 1. 将多个连续换行（包括有空格的）替换为单个换行
+	re := regexp.MustCompile(`\n[\s\n]*`)
+	text = re.ReplaceAllString(text, "\n")
+
+	// 2. 按行处理，移除行尾空白
+	lines := strings.Split(text, "\n")
+	var cleanLines []string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		// 3. 移除纯空白行（保留内容行）
+		if line != "" {
+			cleanLines = append(cleanLines, line)
+		}
+	}
+
+	// 4. 用单个换行重新连接
+	result := strings.Join(cleanLines, "\n")
+	return strings.TrimSpace(result)
 }

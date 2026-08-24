@@ -4,7 +4,7 @@ server:
   port: 8080
 
 db:
-  dsn: "postgres://gexue:gexue@localhost:5432/gexue?sslmode=disable"
+  dsn: "postgres://gexue:gexue_password@localhost:5432/gexue?sslmode=disable&client_encoding=UTF8"
 
 llm:
   ark_api_key: ${ARK_API_KEY}
@@ -25,9 +25,30 @@ auth:
   jwt_secret: ${JWT_SECRET_KEY}
   token_ttl_hours: 168
 
+# 阿里云短信配置（可选；留空则用开发模式）
+aliyun_sms:
+  access_key_id: ${ALIYUN_ACCESS_KEY_ID}
+  access_key_secret: ${ALIYUN_ACCESS_KEY_SECRET}
+  sign_name: ${ALIYUN_SMS_SIGN_NAME}
+  template_code: ${ALIYUN_SMS_TEMPLATE_CODE}
+
+
 chunk:
   max_chunk: 500
   overlap: 60
+
+# 阿里云 OSS 配置（从环境变量读取）
+oss:
+  access_key_id: ""
+  access_key_secret: ""
+  bucket: ""
+  endpoint: ""
+  accel_endpoint: ""
+
+# 火山引擎 OCR 配置（从环境变量读取）
+volcengine:
+  visual_ak: ""
+  visual_sk: ""
 
 log:
   level: debug

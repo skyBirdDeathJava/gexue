@@ -13,49 +13,49 @@ type AuthHandler struct {
 
 func NewAuthHandler(svc *service.AuthService) *AuthHandler { return &AuthHandler{svc: svc} }
 
-type authReq struct {
-	Phone    string `json:"phone" binding:"required"`
-	Password string `json:"password" binding:"required,min=6"`
+type sendCodeReq struct {
+	Phone string `json:"phone" binding:"required"`
 }
 
-func (h *AuthHandler) Register(c *gin.Context) {
-	var in authReq
+type phoneAuthReq struct {
+	Phone string `json:"phone" binding:"required"`
+	Code  string `json:"code" binding:"required"`
+}
+
+// SendCode 发送登录验证码
+func (h *AuthHandler) SendCode(c *gin.Context) {
+	var in sendCodeReq
 	if err := c.ShouldBindJSON(&in); err != nil {
 		resp.Fail(c, resp.CodeBadRequest, err.Error())
 		return
 	}
-	u, err := h.svc.Register(c.Request.Context(), in.Phone, in.Password)
+	if err := h.svc.SendVerifyCode(c.Request.Context(), in.Phone); err != nil {
+		resp.Fail(c, resp.CodeInternal, err.Error())
+		return
+	}
+	resp.OK(c, gin.H{"message": "验证码已发送"})
+}
+
+// LoginByPhone 手机号 + 验证码登录，首次自动注册
+func (h *AuthHandler) LoginByPhone(c *gin.Context) {
+	var in phoneAuthReq
+	if err := c.ShouldBindJSON(&in); err != nil {
+		resp.Fail(c, resp.CodeBadRequest, err.Error())
+		return
+	}
+	token, u, isNew, err := h.svc.LoginByPhone(c.Request.Context(), in.Phone, in.Code)
 	if err != nil {
-		if err == service.ErrPhoneExists {
-			resp.Fail(c, resp.CodeBadRequest, "手机号已注册")
+		if err == service.ErrInvalidCode {
+			resp.Fail(c, resp.CodeBadRequest, "验证码错误或已过期")
 			return
 		}
 		resp.Fail(c, resp.CodeInternal, err.Error())
 		return
 	}
-	resp.OK(c, u)
-}
-
-func (h *AuthHandler) Login(c *gin.Context) {
-	var in authReq
-	if err := c.ShouldBindJSON(&in); err != nil {
-		resp.Fail(c, resp.CodeBadRequest, err.Error())
-		return
-	}
-	token, u, err := h.svc.Login(c.Request.Context(), in.Phone, in.Password)
-	if err != nil {
-		if err == service.ErrBadLogin {
-			resp.Fail(c, resp.CodeUnauthorized, "手机号或密码错误")
-			return
-		}
-		resp.Fail(c, resp.CodeInternal, err.Error())
-		return
-	}
-	resp.OK(c, gin.H{"token": token, "user": u})
+	resp.OK(c, gin.H{"token": token, "user": u, "is_new": isNew})
 }
 
 func (h *AuthHandler) Me(c *gin.Context) {
 	userID := c.GetUint("user_id")
-	// 通过 AuthService 暴露的查询（此处简化为返回 user_id；完整信息可由 UserRepo 补）
 	resp.OK(c, gin.H{"user_id": userID})
 }

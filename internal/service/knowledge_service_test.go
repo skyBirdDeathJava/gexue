@@ -2,42 +2,74 @@ package service
 
 import (
 	"testing"
-
-	"gexue/internal/model"
 )
 
-func uintPtr(v uint) *uint { return &v }
+func TestNormalizeText(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "多个连续换行",
+			input:    "行1\n\n\n行2",
+			expected: "行1\n行2",
+		},
+		{
+			name:     "带空格的换行",
+			input:    "行1\n   \n行2",
+			expected: "行1\n行2",
+		},
+		{
+			name:     "行尾空白",
+			input:    "行1   \n行2  ",
+			expected: "行1\n行2",
+		},
+		{
+			name:     "复杂混合",
+			input:    "行1\n\n  \n\n行2\n\n\n行3",
+			expected: "行1\n行2\n行3",
+		},
+		{
+			name:     "空白行",
+			input:    "  行1  \n   \n  行2  ",
+			expected: "行1\n行2",
+		},
+		{
+			name:     "前后空白",
+			input:    "  \n\n行1\n行2\n\n  ",
+			expected: "行1\n行2",
+		},
+		{
+			name:     "正常文本（无变化）",
+			input:    "行1\n行2\n行3",
+			expected: "行1\n行2\n行3",
+		},
+		{
+			name:     "单行",
+			input:    "单行文本",
+			expected: "单行文本",
+		},
+		{
+			name:     "空文本",
+			input:    "",
+			expected: "",
+		},
+	}
 
-// TestBuildTreeNested 三层树：根先出现在输入中，验证子节点仍能挂上（顺序无关）。
-func TestBuildTreeNested(t *testing.T) {
-	points := []model.KnowledgePoint{
-		{ID: 1, Name: "数与运算"}, // 根
-		{ID: 2, Name: "20以内加减法", ParentID: uintPtr(1)},
-		{ID: 3, Name: "进位加法", ParentID: uintPtr(2)},
-	}
-	roots := buildTree(points)
-	if len(roots) != 1 {
-		t.Fatalf("want 1 root, got %d", len(roots))
-	}
-	if roots[0].ID != 1 {
-		t.Fatalf("root id mismatch: %d", roots[0].ID)
-	}
-	if len(roots[0].Children) != 1 || roots[0].Children[0].ID != 2 {
-		t.Fatalf("root children wrong: %+v", roots[0].Children)
-	}
-	child := roots[0].Children[0]
-	if len(child.Children) != 1 || child.Children[0].ID != 3 {
-		t.Fatalf("grandchild missing: %+v", child.Children)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := normalizeText(tt.input)
+			if result != tt.expected {
+				t.Errorf("normalizeText() = %q, want %q", result, tt.expected)
+			}
+		})
 	}
 }
 
-// TestBuildTreeOrphan 父缺失（孤儿）兜底为根。
-func TestBuildTreeOrphan(t *testing.T) {
-	points := []model.KnowledgePoint{
-		{ID: 2, Name: "孤立节点", ParentID: uintPtr(99)},
-	}
-	roots := buildTree(points)
-	if len(roots) != 1 || roots[0].ID != 2 {
-		t.Fatalf("orphan should be root, got %+v", roots)
+func BenchmarkNormalizeText(b *testing.B) {
+	input := "行1\n\n\n行2\n  \n行3\n\n\n行4"
+	for i := 0; i < b.N; i++ {
+		normalizeText(input)
 	}
 }

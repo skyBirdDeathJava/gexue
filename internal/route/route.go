@@ -1,10 +1,12 @@
-// Package api Gin 路由注册
-package api
+// Package route 各业务模块路由，按模块拆分（auth / knowledge / quiz）。
+// 容器入口：NewRouter 组装 Gin Engine 并聚合各模块注册。
+package route
 
 import (
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
+	"gexue/internal/api"
 	"gexue/internal/api/middleware"
 	"gexue/internal/api/resp"
 )
@@ -17,11 +19,13 @@ type Router struct {
 
 // Deps 路由依赖（service 由 main 装配后注入）。
 type Deps struct {
-	Auth      *AuthHandler
-	Knowledge *KnowledgeHandler
+	Auth      *api.AuthHandler
+	Knowledge *api.KnowledgeHandler
+	Quiz      *api.QuizHandler
 	JWTSecret string
 }
 
+// NewRouter 组装 Engine + 全局中间件，并按模块聚合路由。
 func NewRouter(log *zap.Logger, deps Deps) *Router {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
@@ -31,20 +35,9 @@ func NewRouter(log *zap.Logger, deps Deps) *Router {
 		resp.OK(c, gin.H{"status": "up"})
 	})
 
-	// 认证（公开）
-	if deps.Auth != nil {
-		auth := r.Group("/api/auth")
-		auth.POST("/register", deps.Auth.Register)
-		auth.POST("/login", deps.Auth.Login)
-		auth.GET("/me", middleware.AuthRequired(deps.JWTSecret), deps.Auth.Me)
-	}
-
-	// 知识库（需登录）
-	if deps.Knowledge != nil {
-		kb := r.Group("/api")
-		kb.Use(middleware.AuthRequired(deps.JWTSecret))
-		deps.Knowledge.Register(kb)
-	}
+	registerAuth(r, deps)
+	registerKnowledge(r, deps)
+	registerQuiz(r, deps)
 
 	return &Router{engine: r, log: log}
 }
