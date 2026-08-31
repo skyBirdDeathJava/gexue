@@ -11,6 +11,7 @@ import (
 
 	"gexue/internal/embedding"
 	"gexue/internal/repo"
+	"gexue/internal/retrieval"
 )
 
 // SessionLogGenerator 会话过程日志生成器
@@ -90,11 +91,12 @@ type LLMConfig struct {
 // 与旧版“意图识别→固定流程分派”不同：Agent 读整段对话后自主决定
 // 要不要出题 / 判分 / 追问 / 解题 / 总结，追问的难度与题型也由它按学生作答判断。
 type Agent struct {
-	repo   *repo.QuizRepo
-	kbRepo *repo.KnowledgeRepo
-	emb    embedding.Embedder
-	llm    model.ChatModel // 未配置时为 nil（各工具/入口兜底返回友好提示）
-	log    *zap.Logger
+	repo      *repo.QuizRepo
+	kbRepo    *repo.KnowledgeRepo
+	emb       embedding.Embedder
+	retriever *retrieval.Retriever // 双路召回检索编排（nil 时回退旧向量检索）
+	llm       model.ChatModel      // 未配置时为 nil（各工具/入口兜底返回友好提示）
+	log       *zap.Logger
 
 	// tools 工具名 → 处理器；在 NewAgent 时注册，LLM 自主调用。
 	tools map[string]toolHandler
@@ -107,8 +109,9 @@ type Agent struct {
 type toolHandler func(ctx context.Context, c *Ctx, argsJSON string) string
 
 // NewAgent 构造 Agent；llmCfg.APIKey 为空时 llm 置 nil（无 key 可编译可测试，入口兜底）。
-func NewAgent(qr *repo.QuizRepo, kr *repo.KnowledgeRepo, emb embedding.Embedder, llmCfg LLMConfig, log *zap.Logger) (*Agent, error) {
-	a := &Agent{repo: qr, kbRepo: kr, emb: emb, log: log, tools: map[string]toolHandler{}}
+// retriever 可为 nil（未注入时 embSearchRaw 回退旧向量检索）。
+func NewAgent(qr *repo.QuizRepo, kr *repo.KnowledgeRepo, emb embedding.Embedder, retriever *retrieval.Retriever, llmCfg LLMConfig, log *zap.Logger) (*Agent, error) {
+	a := &Agent{repo: qr, kbRepo: kr, emb: emb, retriever: retriever, log: log, tools: map[string]toolHandler{}}
 
 	if llmCfg.APIKey != "" {
 		baseURL := llmCfg.BaseURL

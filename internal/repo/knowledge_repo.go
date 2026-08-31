@@ -189,3 +189,15 @@ func (r *KnowledgeRepo) SearchInKb(ctx context.Context, kbID uint, vec pgvector.
 		Find(&chunks).Error
 	return chunks, err
 }
+
+// ListChunksForSearch 拉取 kb 内全部分块（仅检索所需字段，不含 content_vec），
+// 供 BM25 应用层打分使用。原型阶段库规模小，全量内存计算即可。
+func (r *KnowledgeRepo) ListChunksForSearch(ctx context.Context, kbID uint) ([]model.KnowledgeChunk, error) {
+	var chunks []model.KnowledgeChunk
+	err := r.db.WithContext(ctx).
+		Select("id", "kb_id", "content_text", "file_name", "source").
+		Where("kb_id = ?", kbID).
+		Order("id").
+		Find(&chunks).Error
+	return chunks, err
+}

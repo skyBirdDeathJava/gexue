@@ -20,8 +20,8 @@ func TestOCRClientInitialization(t *testing.T) {
 		t.Fatal("failed to create OCR client")
 	}
 
-	if client.client == nil {
-		t.Fatal("visual client is nil")
+	if client.ak == "" || client.sk == "" {
+		t.Fatal("ocr credentials not stored on client")
 	}
 }
 

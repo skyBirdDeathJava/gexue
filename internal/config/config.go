@@ -6,6 +6,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strconv"
 
 	"github.com/spf13/viper"
 )
@@ -15,6 +16,7 @@ type Config struct {
 	DB         DB
 	LLM        LLM
 	Embedding  Embedding
+	Rerank     Rerank
 	Auth       Auth
 	Chunk      Chunk
 	Log        Log
@@ -65,6 +67,17 @@ type Embedding struct {
 	BaseURL  string `mapstructure:"base_url"`
 }
 
+// Rerank 精排配置。默认 DashScope qwen3-rerank（gte-rerank-v2 已于 2026-05-30 停服）。
+// Enabled=false 或 APIKey 为空时跳过精排，仅返回 RRF 融合结果。
+type Rerank struct {
+	Enabled  bool   `mapstructure:"enabled"`
+	Provider string // dashscope
+	Model    string
+	APIKey   string `mapstructure:"api_key"`
+	BaseURL  string `mapstructure:"base_url"`
+	TopN     int    `mapstructure:"top_n"` // 送精排候选数
+}
+
 type Log struct {
 	Level string
 }
@@ -111,6 +124,18 @@ func Load(path string) (*Config, error) {
 	if cfg.Embedding.Dim == 0 {
 		cfg.Embedding.Dim = 512
 	}
+	if cfg.Rerank.Provider == "" {
+		cfg.Rerank.Provider = "dashscope"
+	}
+	if cfg.Rerank.Model == "" {
+		cfg.Rerank.Model = "qwen3-rerank"
+	}
+	if cfg.Rerank.BaseURL == "" {
+		cfg.Rerank.BaseURL = "https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank"
+	}
+	if cfg.Rerank.TopN == 0 {
+		cfg.Rerank.TopN = 20
+	}
 	if cfg.Auth.TokenTTLHours == 0 {
 		cfg.Auth.TokenTTLHours = 168 // 7 天，对齐 mianba ACCESS_TOKEN_EXPIRE_MINUTES
 	}
@@ -138,6 +163,29 @@ func overrideFromEnv(cfg *Config) {
 	if v := os.Getenv("DASHSCOPE_API_KEY"); v != "" {
 		cfg.LLM.DashScopeAPIKey = v
 		cfg.Embedding.APIKey = v
+		// rerank 默认复用同一把 DashScope key（viper 不展开 ${} 占位符，须无条件覆盖；
+		// 如需独立 key 由下方 RERANK_API_KEY 再覆盖）
+		cfg.Rerank.APIKey = v
+	}
+	// 重排（rerank）配置覆盖
+	if v := os.Getenv("RERANK_ENABLED"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			cfg.Rerank.Enabled = b
+		}
+	}
+	if v := os.Getenv("RERANK_MODEL"); v != "" {
+		cfg.Rerank.Model = v
+	}
+	if v := os.Getenv("RERANK_API_KEY"); v != "" {
+		cfg.Rerank.APIKey = v
+	}
+	if v := os.Getenv("RERANK_BASE_URL"); v != "" {
+		cfg.Rerank.BaseURL = v
+	}
+	if v := os.Getenv("RERANK_TOP_N"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.Rerank.TopN = n
+		}
 	}
 	if v := os.Getenv("JWT_SECRET_KEY"); v != "" {
 		cfg.Auth.JWTSecret = v

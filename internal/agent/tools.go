@@ -587,8 +587,12 @@ type chunkView struct {
 	Content string
 }
 
-// embSearchRaw 库内语义检索（HNSW + 余弦）：校验 KB 归属 → 向量化 query → 检索。
+// embSearchRaw 库内检索：已注入 retriever 时走双路召回（向量 + BM25）→ RRF → rerank；
+// 未注入则回退为旧单路向量检索（HNSW + 余弦）。
 func (a *Agent) embSearchRaw(ctx context.Context, userID, kbID uint, query string, topK int) ([]model.KnowledgeChunk, error) {
+	if a.retriever != nil {
+		return a.retriever.Search(ctx, userID, kbID, query, topK)
+	}
 	if a.emb == nil {
 		return nil, fmt.Errorf("embedder not configured")
 	}

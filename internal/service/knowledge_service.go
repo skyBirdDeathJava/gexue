@@ -15,12 +15,14 @@ import (
 	"gexue/internal/pkg/document"
 	"gexue/internal/pkg/volcengine"
 	"gexue/internal/repo"
+	"gexue/internal/retrieval"
 )
 
 // KnowledgeService 知识库编排。
 type KnowledgeService struct {
 	repo      *repo.KnowledgeRepo
 	emb       embedding.Embedder
+	retriever *retrieval.Retriever                             // 双路召回检索编排（nil 时回退旧向量检索）
 	ossUpload func(objectKey, filePath string) (string, error) // OSS 上传函数
 	ocrClient *volcengine.OCRClient                            // 火山引擎 OCR 客户端
 	logger    *zap.Logger                                      // 日志记录器
@@ -38,6 +40,11 @@ func NewKnowledgeService(r *repo.KnowledgeRepo, e embedding.Embedder, maxChunk, 
 	}
 	logger, _ := zap.NewProduction()
 	return &KnowledgeService{repo: r, emb: e, maxChunk: maxChunk, overlap: overlap, logger: logger}
+}
+
+// SetRetriever 注入双路召回检索编排器（RRF + rerank）。
+func (s *KnowledgeService) SetRetriever(r *retrieval.Retriever) {
+	s.retriever = r
 }
 
 // SetOSSUpload 注入 OSS 上传函数
@@ -242,8 +249,13 @@ func (s *KnowledgeService) DeleteBase(ctx context.Context, userID, kbID uint) er
 	return s.repo.DeleteBase(ctx, userID, kbID)
 }
 
-// SearchInKb 库内语义检索（出题/回忆用）
+// SearchInKb 库内语义检索（出题/回忆用）。
+// 已注入 retriever 时走双路召回（向量 + BM25）→ RRF 融合 → rerank 精排；
+// 未注入（兼容旧调用）则回退为单路向量检索。
 func (s *KnowledgeService) SearchInKb(ctx context.Context, userID, kbID uint, query string, topK int) ([]model.KnowledgeChunk, error) {
+	if s.retriever != nil {
+		return s.retriever.Search(ctx, userID, kbID, query, topK)
+	}
 	if _, err := s.repo.GetBase(ctx, userID, kbID); err != nil {
 		return nil, err
 	}
