@@ -201,3 +201,14 @@ func (r *KnowledgeRepo) ListChunksForSearch(ctx context.Context, kbID uint) ([]m
 		Find(&chunks).Error
 	return chunks, err
 }
+
+// CountChunks 统计 kb 内分块数量。BM25 倒排索引缓存以此作为版本号：
+// 分块数变化（新增/删除/重写）即视为内容变更，需重建索引。走 kb_id 索引，
+// 每次查询一次 COUNT，代价远低于全量重建。
+func (r *KnowledgeRepo) CountChunks(ctx context.Context, kbID uint) (int64, error) {
+	var count int64
+	err := r.db.WithContext(ctx).Model(&model.KnowledgeChunk{}).
+		Where("kb_id = ?", kbID).
+		Count(&count).Error
+	return count, err
+}

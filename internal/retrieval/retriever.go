@@ -5,6 +5,7 @@ package retrieval
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/pgvector/pgvector-go"
 	"go.uber.org/zap"
@@ -15,10 +16,18 @@ import (
 	"gexue/internal/rerank"
 )
 
+// chunkSource BM25 索引所需的分块数据源（CountChunks 作缓存版本、ListChunksForSearch 全量拉取）。
+// 生产实现为 *repo.KnowledgeRepo；测试可注入内存 fake 验证缓存重建。
+type chunkSource interface {
+	CountChunks(ctx context.Context, kbID uint) (int64, error)
+	ListChunksForSearch(ctx context.Context, kbID uint) ([]model.KnowledgeChunk, error)
+}
+
 // Retriever 检索编排器。
 // reranker 可为 nil（未配置 rerank key 时跳过精排，仅返回 RRF 融合结果）。
 type Retriever struct {
-	repo     *repo.KnowledgeRepo
+	repo   *repo.KnowledgeRepo
+	chunks chunkSource // BM25 数据源，默认即 repo，测试可注入
 	emb      embedding.Embedder
 	reranker rerank.Reranker
 	log      *zap.Logger
@@ -27,6 +36,14 @@ type Retriever struct {
 	keywordTopK int // BM25 召回数量
 	rerankTopN  int // 送精排的候选数（从 RRF 融合结果取前 N）
 	rrfK        int // RRF 常数
+
+	bm25Cache sync.Map // kbID(uint) → *bm25CacheEntry：BM25 倒排索引缓存
+}
+
+// bm25CacheEntry BM25 索引缓存项。
+type bm25CacheEntry struct {
+	version int64     // 知识库分块数（COUNT），作为内容版本：变化即重建
+	idx     *bm25Index
 }
 
 // RetrieverOption 配置项（函数式选项，便于调用方按需覆盖）。
@@ -47,7 +64,7 @@ func WithRRFK(k int) RetrieverOption { return func(r *Retriever) { r.rrfK = k } 
 // NewRetriever 构造检索编排器。
 func NewRetriever(r *repo.KnowledgeRepo, e embedding.Embedder, reranker rerank.Reranker, log *zap.Logger, opts ...RetrieverOption) *Retriever {
 	rt := &Retriever{
-		repo: r, emb: e, reranker: reranker, log: log,
+		repo: r, chunks: r, emb: e, reranker: reranker, log: log,
 		vectorTopK: 20, keywordTopK: 20, rerankTopN: 20, rrfK: DefaultRRFK,
 	}
 	for _, o := range opts {
@@ -94,8 +111,8 @@ func (r *Retriever) Search(ctx context.Context, userID, kbID uint, query string,
 		kwTopK = topK * 3
 	}
 	var kwChunks []model.KnowledgeChunk
-	if allChunks, err := r.repo.ListChunksForSearch(ctx, kbID); err == nil {
-		kwChunks = BM25Search(allChunks, query, kwTopK)
+	if idx, err := r.getBM25Index(ctx, kbID); err == nil {
+		kwChunks = idx.Search(query, kwTopK)
 	} else if r.log != nil {
 		r.log.Warn("bm25 recall failed, fallback to vector-only",
 			zap.Uint("kb_id", kbID), zap.Error(err))
@@ -126,6 +143,31 @@ func (r *Retriever) Search(ctx context.Context, userID, kbID uint, query string,
 		fused = fused[:topK]
 	}
 	return fused, nil
+}
+
+// getBM25Index 取 kbID 的 BM25 倒排索引：
+//   - 缓存命中且版本（分块 COUNT）一致 → 直接复用；
+//   - 缓存缺失或版本变化（新增/删除分块）→ 全量拉取分块重建并缓存。
+//
+// 每次查询一次 COUNT（走 kb_id 索引）+ 一次倒排查询，不再全量重建/全量打分。
+func (r *Retriever) getBM25Index(ctx context.Context, kbID uint) (*bm25Index, error) {
+	version, err := r.chunks.CountChunks(ctx, kbID)
+	if err != nil {
+		return nil, err
+	}
+	if v, ok := r.bm25Cache.Load(kbID); ok {
+		entry := v.(*bm25CacheEntry)
+		if entry.version == version {
+			return entry.idx, nil
+		}
+	}
+	allChunks, err := r.chunks.ListChunksForSearch(ctx, kbID)
+	if err != nil {
+		return nil, err
+	}
+	idx := buildBM25Index(allChunks, defaultSegmenter())
+	r.bm25Cache.Store(kbID, &bm25CacheEntry{version: version, idx: idx})
+	return idx, nil
 }
 
 // rerank 取融合后前 rerankTopN 送精排，按相关性分重排后截断 topK。
