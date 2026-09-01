@@ -228,7 +228,7 @@ func TestToolGenerateMissingPoint(t *testing.T) {
 
 // TestNewAgentNoKey 无 API Key 时 llm 为 nil，工具注册好，可编译可调用（入口兜底）。
 func TestNewAgentNoKey(t *testing.T) {
-	a, err := NewAgent(repo.NewQuizRepo(nil), repo.NewKnowledgeRepo(nil), nil, LLMConfig{}, nil)
+	a, err := NewAgent(repo.NewQuizRepo(nil), repo.NewKnowledgeRepo(nil), nil, nil, LLMConfig{}, nil)
 	if err != nil {
 		t.Fatalf("NewAgent err: %v", err)
 	}
@@ -242,7 +242,7 @@ func TestNewAgentNoKey(t *testing.T) {
 
 // TestToolInfosSerializable 工具参数 schema 可序列化为 JSON（供大模型解析）。
 func TestToolInfosSerializable(t *testing.T) {
-	a, _ := NewAgent(repo.NewQuizRepo(nil), repo.NewKnowledgeRepo(nil), nil, LLMConfig{}, nil)
+	a, _ := NewAgent(repo.NewQuizRepo(nil), repo.NewKnowledgeRepo(nil), nil, nil, LLMConfig{}, nil)
 	for _, ti := range a.toolInfos {
 		s, err := ti.ParamsOneOf.ToJSONSchema()
 		if err != nil {

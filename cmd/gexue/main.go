@@ -21,6 +21,8 @@ import (
 	"gexue/internal/pkg/sms"
 	"gexue/internal/pkg/volcengine"
 	"gexue/internal/repo"
+	"gexue/internal/rerank"
+	"gexue/internal/retrieval"
 	"gexue/internal/route"
 	"gexue/internal/service"
 )
@@ -72,7 +74,24 @@ func main() {
 	// ---- 知识库 ----
 	emb := embedding.NewDashScope(cfg.Embedding.APIKey, cfg.Embedding.Model, cfg.Embedding.Dim)
 	kbRepo := repo.NewKnowledgeRepo(db)
+
+	// rerank 精排（可选）：未启用/无 key 时跳过精排，仅返回 RRF 融合结果
+	var reranker rerank.Reranker
+	if cfg.Rerank.Enabled && cfg.Rerank.APIKey != "" {
+		reranker = rerank.NewDashScopeWithURL(cfg.Rerank.APIKey, cfg.Rerank.Model, cfg.Rerank.BaseURL)
+		logger.Info("rerank enabled",
+			zap.String("model", cfg.Rerank.Model), zap.Int("top_n", cfg.Rerank.TopN))
+	} else {
+		logger.Warn("rerank disabled, will fall back to rrf fusion result",
+			zap.Bool("enabled", cfg.Rerank.Enabled), zap.Bool("has_key", cfg.Rerank.APIKey != ""))
+	}
+
+	// 双路召回检索编排：向量 + BM25 → RRF 融合 → rerank 精排
+	retriever := retrieval.NewRetriever(kbRepo, emb, reranker, logger,
+		retrieval.WithRerankTopN(cfg.Rerank.TopN))
+
 	kbSvc := service.NewKnowledgeService(kbRepo, emb, cfg.Chunk.MaxChunk, cfg.Chunk.Overlap)
+	kbSvc.SetRetriever(retriever)
 
 	// 初始化火山引擎 OCR 客户端（可选，知识库与答题图片共用）
 	var ocrClient *volcengine.OCRClient
@@ -111,7 +130,7 @@ func main() {
 
 	// ---- 模拟测试 Agent ----
 	quizRepo := repo.NewQuizRepo(db)
-	quizAgent, err := agent.NewAgent(quizRepo, kbRepo, emb, agent.LLMConfig{
+	quizAgent, err := agent.NewAgent(quizRepo, kbRepo, emb, retriever, agent.LLMConfig{
 		Provider: "deepseek",
 		APIKey:   cfg.LLM.DeepSeekV4APIKey,
 		BaseURL:  cfg.LLM.DeepSeekV4BaseURL,

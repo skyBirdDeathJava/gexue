@@ -21,6 +21,15 @@ embedding:
   model: text-embedding-v3
   dim: 512
 
+# 精排（rerank）配置；enabled=false 或 api_key 为空时跳过精排，仅返回 RRF 融合结果
+rerank:
+  enabled: true
+  provider: dashscope
+  model: qwen3-rerank
+  api_key: ${DASHSCOPE_API_KEY}
+  base_url: https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank
+  top_n: 20
+
 auth:
   jwt_secret: ${JWT_SECRET_KEY}
   token_ttl_hours: 168
