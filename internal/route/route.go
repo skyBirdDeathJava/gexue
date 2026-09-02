@@ -4,11 +4,13 @@ package route
 
 import (
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 
 	"gexue/internal/api"
 	"gexue/internal/api/middleware"
 	"gexue/internal/api/resp"
+	"gexue/internal/metrics"
 )
 
 // Router 路由容器。
@@ -29,11 +31,14 @@ type Deps struct {
 func NewRouter(log *zap.Logger, deps Deps) *Router {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
-	r.Use(middleware.RequestID(), middleware.Recover(log), middleware.Logger(log))
+	r.Use(middleware.RequestID(), middleware.Recover(log), middleware.Logger(log), metrics.MetricsMiddleware())
 
 	r.GET("/health", func(c *gin.Context) {
 		resp.OK(c, gin.H{"status": "up"})
 	})
+
+	// Prometheus 指标端点（promhttp 暴露默认 registry 全部指标，供 Prometheus 抓取）
+	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
 	registerAuth(r, deps)
 	registerKnowledge(r, deps)

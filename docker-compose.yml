@@ -20,6 +20,41 @@ services:
       timeout: 5s
       retries: 5
 
+  # 指标采集：抓取宿主机 gexue 服务（端口 8080）的 /metrics
+  prometheus:
+    image: prom/prometheus:latest
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./configs/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    networks:
+      - gexue-network
+    extra_hosts:
+      - "host.docker.internal:host-gateway"  # Linux 兼容；macOS/colima 亦可
+    depends_on:
+      - postgres
+
+  # 指标可视化：自动注册 Prometheus 数据源 + 导入 dashboard
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./configs/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./configs/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./configs/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    networks:
+      - gexue-network
+    depends_on:
+      - prometheus
+
 volumes:
   postgres_data:
 

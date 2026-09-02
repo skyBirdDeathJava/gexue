@@ -78,8 +78,10 @@ type Rerank struct {
 	TopN     int    `mapstructure:"top_n"` // 送精排候选数
 }
 
+// Log 日志配置。Level: debug/info/warn/error；File: 日志文件路径（空则仅控制台）。
 type Log struct {
 	Level string
+	File  string
 }
 
 // OSS 阿里云对象存储配置（与 mianba config.py 对齐）
@@ -192,6 +194,9 @@ func overrideFromEnv(cfg *Config) {
 	}
 	if v := os.Getenv("DB_DSN"); v != "" {
 		cfg.DB.DSN = v
+	}
+	if v := os.Getenv("LOG_FILE"); v != "" {
+		cfg.Log.File = v
 	}
 	if v := os.Getenv("OSS_ACCESS_KEY_ID"); v != "" {
 		cfg.OSS.AccessKeyID = v

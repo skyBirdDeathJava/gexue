@@ -6,11 +6,13 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/pgvector/pgvector-go"
 	"go.uber.org/zap"
 
 	"gexue/internal/embedding"
+	"gexue/internal/metrics"
 	"gexue/internal/model"
 	"gexue/internal/repo"
 	"gexue/internal/rerank"
@@ -26,11 +28,12 @@ type chunkSource interface {
 // Retriever 检索编排器。
 // reranker 可为 nil（未配置 rerank key 时跳过精排，仅返回 RRF 融合结果）。
 type Retriever struct {
-	repo   *repo.KnowledgeRepo
-	chunks chunkSource // BM25 数据源，默认即 repo，测试可注入
+	repo     *repo.KnowledgeRepo
+	chunks   chunkSource // BM25 数据源，默认即 repo，测试可注入
 	emb      embedding.Embedder
 	reranker rerank.Reranker
 	log      *zap.Logger
+	metrics  *metrics.RetrievalMetrics // Prometheus 检索链路指标（nil 时跳过埋点）
 
 	vectorTopK  int // 向量召回数量
 	keywordTopK int // BM25 召回数量
@@ -42,7 +45,7 @@ type Retriever struct {
 
 // bm25CacheEntry BM25 索引缓存项。
 type bm25CacheEntry struct {
-	version int64     // 知识库分块数（COUNT），作为内容版本：变化即重建
+	version int64 // 知识库分块数（COUNT），作为内容版本：变化即重建
 	idx     *bm25Index
 }
 
@@ -61,6 +64,11 @@ func WithRerankTopN(n int) RetrieverOption { return func(r *Retriever) { r.reran
 // WithRRFK 设置 RRF 融合常数。
 func WithRRFK(k int) RetrieverOption { return func(r *Retriever) { r.rrfK = k } }
 
+// WithMetrics 注入 Prometheus 检索链路指标（nil 时跳过埋点，不影响既有逻辑）。
+func WithMetrics(m *metrics.RetrievalMetrics) RetrieverOption {
+	return func(r *Retriever) { r.metrics = m }
+}
+
 // NewRetriever 构造检索编排器。
 func NewRetriever(r *repo.KnowledgeRepo, e embedding.Embedder, reranker rerank.Reranker, log *zap.Logger, opts ...RetrieverOption) *Retriever {
 	rt := &Retriever{
@@ -75,7 +83,18 @@ func NewRetriever(r *repo.KnowledgeRepo, e embedding.Embedder, reranker rerank.R
 
 // Search 双路召回 → RRF 融合 → rerank 精排，返回最终 topK 分块。
 // 与旧版 SearchInKb 同语义：严格限定所选知识库（kb_id 隔离）。
-func (r *Retriever) Search(ctx context.Context, userID, kbID uint, query string, topK int) ([]model.KnowledgeChunk, error) {
+// 埋点：defer 统一记录总耗时与请求结果；各阶段分别记录耗时与召回条数。
+func (r *Retriever) Search(ctx context.Context, userID, kbID uint, query string, topK int) (chunks []model.KnowledgeChunk, err error) {
+	start := time.Now()
+	defer func() {
+		result := "success"
+		if err != nil {
+			result = "error"
+		}
+		r.metrics.ObserveStage("total", time.Since(start))
+		r.metrics.IncRequests(result)
+	}()
+
 	if topK <= 0 {
 		topK = 5
 	}
@@ -91,6 +110,7 @@ func (r *Retriever) Search(ctx context.Context, userID, kbID uint, query string,
 	if vecTopK < topK*3 {
 		vecTopK = topK * 3
 	}
+	vecStart := time.Now()
 	vecs, err := r.emb.Embed(ctx, []string{query})
 	if err != nil {
 		return nil, err
@@ -99,6 +119,8 @@ func (r *Retriever) Search(ctx context.Context, userID, kbID uint, query string,
 	if err != nil {
 		return nil, fmt.Errorf("vector recall: %w", err)
 	}
+	r.metrics.ObserveStage("vector", time.Since(vecStart))
+	r.metrics.ObserveRecall("vector", len(vecChunks))
 	if r.log != nil {
 		r.log.Debug("vector recall",
 			zap.Uint("kb_id", kbID), zap.String("query", query),
@@ -110,13 +132,17 @@ func (r *Retriever) Search(ctx context.Context, userID, kbID uint, query string,
 	if kwTopK < topK*3 {
 		kwTopK = topK * 3
 	}
+	kwStart := time.Now()
 	var kwChunks []model.KnowledgeChunk
-	if idx, err := r.getBM25Index(ctx, kbID); err == nil {
+	if idx, idxErr := r.getBM25Index(ctx, kbID); idxErr == nil {
 		kwChunks = idx.Search(query, kwTopK)
 	} else if r.log != nil {
 		r.log.Warn("bm25 recall failed, fallback to vector-only",
-			zap.Uint("kb_id", kbID), zap.Error(err))
+			zap.Uint("kb_id", kbID), zap.Error(idxErr))
+		r.metrics.IncFallback("bm25_failed")
 	}
+	r.metrics.ObserveStage("bm25", time.Since(kwStart))
+	r.metrics.ObserveRecall("bm25", len(kwChunks))
 	if r.log != nil {
 		r.log.Debug("bm25 recall",
 			zap.Uint("kb_id", kbID), zap.String("query", query),
@@ -124,17 +150,22 @@ func (r *Retriever) Search(ctx context.Context, userID, kbID uint, query string,
 	}
 
 	// ③ RRF 融合
+	rrfStart := time.Now()
 	fused := RRF([][]model.KnowledgeChunk{vecChunks, kwChunks}, r.rrfK)
+	r.metrics.ObserveStage("rrf", time.Since(rrfStart))
 
 	// ④ rerank 精排（未配置或失败 → 回退 RRF 结果）
 	if r.reranker != nil && len(fused) > 0 {
-		if reranked, err := r.rerank(ctx, query, fused, topK); err == nil {
+		rkStart := time.Now()
+		if reranked, rkErr := r.rerank(ctx, query, fused, topK); rkErr == nil {
+			r.metrics.ObserveStage("rerank", time.Since(rkStart))
 			if r.log != nil {
 				r.log.Debug("rerank done", zap.Uint("kb_id", kbID), zap.Int("candidates", len(fused)), zap.Int("returned", len(reranked)))
 			}
 			return reranked, nil
 		} else if r.log != nil {
-			r.log.Warn("rerank failed, fallback to rrf result", zap.Error(err))
+			r.log.Warn("rerank failed, fallback to rrf result", zap.Error(rkErr))
+			r.metrics.IncFallback("rerank_failed")
 		}
 	}
 
@@ -158,9 +189,11 @@ func (r *Retriever) getBM25Index(ctx context.Context, kbID uint) (*bm25Index, er
 	if v, ok := r.bm25Cache.Load(kbID); ok {
 		entry := v.(*bm25CacheEntry)
 		if entry.version == version {
+			r.metrics.IncBM25Cache(true)
 			return entry.idx, nil
 		}
 	}
+	r.metrics.IncBM25Cache(false)
 	allChunks, err := r.chunks.ListChunksForSearch(ctx, kbID)
 	if err != nil {
 		return nil, err

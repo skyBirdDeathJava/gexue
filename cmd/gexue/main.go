@@ -5,10 +5,13 @@ package main
 import (
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/joho/godotenv"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 
@@ -16,6 +19,7 @@ import (
 	"gexue/internal/api"
 	"gexue/internal/config"
 	"gexue/internal/embedding"
+	"gexue/internal/metrics"
 	"gexue/internal/model"
 	"gexue/internal/pkg/oss"
 	"gexue/internal/pkg/sms"
@@ -87,8 +91,10 @@ func main() {
 	}
 
 	// 双路召回检索编排：向量 + BM25 → RRF 融合 → rerank 精排
+	// 注入 Prometheus 检索链路指标（/metrics 暴露，Grafana 观测）
 	retriever := retrieval.NewRetriever(kbRepo, emb, reranker, logger,
-		retrieval.WithRerankTopN(cfg.Rerank.TopN))
+		retrieval.WithRerankTopN(cfg.Rerank.TopN),
+		retrieval.WithMetrics(metrics.NewRetrievalMetrics()))
 
 	kbSvc := service.NewKnowledgeService(kbRepo, emb, cfg.Chunk.MaxChunk, cfg.Chunk.Overlap)
 	kbSvc.SetRetriever(retriever)
@@ -178,13 +184,37 @@ func main() {
 	}
 }
 
+// initLogger 构建 zap logger。
+// 输出：
+//   - 控制台始终输出（stdout）；
+//   - 配置了 log.file 时同时追加写文件（自动创建目录；文件打开失败仅告警，降级为纯控制台）。
+//
+// 编码：debug 级别用人类可读的 Console 编码，其余用 JSON（对齐 zap.NewDevelopment/NewProduction）。
 func initLogger(cfg *config.Config) *zap.Logger {
-	if cfg.Log.Level == "debug" {
-		logger, _ := zap.NewDevelopment()
-		return logger
+	// 输出目标：默认仅控制台；配置 log.file 时控制台 + 文件双写
+	ws := zapcore.Lock(os.Stdout)
+	if cfg.Log.File != "" {
+		if err := os.MkdirAll(filepath.Dir(cfg.Log.File), 0o755); err != nil {
+			log.Printf("create log dir %s failed, keep stdout only: %v", cfg.Log.File, err)
+		} else if f, err := os.OpenFile(cfg.Log.File, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err != nil {
+			log.Printf("open log file %s failed, keep stdout only: %v", cfg.Log.File, err)
+		} else {
+			ws = zapcore.NewMultiWriteSyncer(zapcore.AddSync(f), zapcore.Lock(os.Stdout))
+		}
 	}
-	logger, _ := zap.NewProduction()
-	return logger
+
+	// 编码器与级别：对齐 zap.NewDevelopment（debug）/ NewProduction（info）
+	var enc zapcore.Encoder
+	var level zapcore.Level
+	if cfg.Log.Level == "debug" {
+		enc = zapcore.NewConsoleEncoder(zap.NewDevelopmentEncoderConfig())
+		level = zapcore.DebugLevel
+	} else {
+		enc = zapcore.NewJSONEncoder(zap.NewProductionEncoderConfig())
+		level = zapcore.InfoLevel
+	}
+
+	return zap.New(zapcore.NewCore(enc, ws, level), zap.AddCaller())
 }
 
 func initDB(cfg *config.Config, logger *zap.Logger) *gorm.DB {

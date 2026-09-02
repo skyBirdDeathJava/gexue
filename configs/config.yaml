@@ -61,3 +61,5 @@ volcengine:
 
 log:
   level: debug
+  # 日志文件路径（相对项目根）；留空则仅输出控制台。启动时自动创建目录。
+  file: "logs/gexue.log"
