@@ -153,48 +153,6 @@ CREATE TABLE IF NOT EXISTS chat_turns (
 
 CREATE INDEX IF NOT EXISTS idx_chat_turns_session_id ON chat_turns(session_id);
 
--- 会话日志表（会话结束时生成）
-CREATE TABLE IF NOT EXISTS session_logs (
-    id SERIAL PRIMARY KEY,
-    user_id INTEGER NOT NULL,
-    session_id INTEGER UNIQUE NOT NULL REFERENCES practice_sessions(id) ON DELETE CASCADE,
-    kb_id INTEGER NOT NULL,
-    started_at TIMESTAMP,
-    ended_at TIMESTAMP,
-    duration_sec INTEGER,
-    total_questions INTEGER,
-    correct_answers INTEGER,
-    wrong_answers INTEGER,
-    correct_rate REAL,
-    knowledge_points JSONB,
-    question_types JSONB,
-    difficulty_stats JSONB,
-    process_flow JSONB,
-    summary TEXT,
-    recommendation TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE INDEX IF NOT EXISTS idx_session_logs_user_id ON session_logs(user_id);
-CREATE INDEX IF NOT EXISTS idx_session_logs_session_id ON session_logs(session_id);
-
--- 会话过程表（会话过程中的一个步骤记录）
-CREATE TABLE IF NOT EXISTS session_processes (
-    id SERIAL PRIMARY KEY,
-    session_id INTEGER NOT NULL REFERENCES practice_sessions(id) ON DELETE CASCADE,
-    step_number INTEGER,
-    timestamp TIMESTAMP,
-    user_message TEXT,
-    agent_intent VARCHAR(32),
-    tool_calls TEXT,
-    result TEXT,
-    question_id INTEGER,
-    is_correct BOOLEAN,
-    frames JSONB
-);
-
-CREATE INDEX IF NOT EXISTS idx_session_processes_session_id ON session_processes(session_id);
-
 -- ================= 初始数据（种子数据） =================
 
 INSERT INTO grades (code, name) VALUES

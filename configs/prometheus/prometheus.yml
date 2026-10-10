@@ -1,0 +1,13 @@
+# Prometheus 抓取配置：采集 gexue 服务的 /metrics。
+# 本地部署（非 docker）：Prometheus 与 gexue 同在宿主机，直接抓 localhost:8080。
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: gexue
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["localhost:8080"]
+        labels:
+          service: gexue

@@ -1,0 +1,12 @@
+# Grafana dashboard 自动导入（启动时加载 dashboards/ 目录下 JSON）。
+apiVersion: 1
+
+providers:
+  - name: gexue
+    orgId: 1
+    folder: gexue
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    options:
+      path: /Users/tal/ww/gexue/configs/grafana/dashboards

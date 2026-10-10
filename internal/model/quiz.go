@@ -80,47 +80,6 @@ type ChatTurn struct {
 	CreatedAt   time.Time       `json:"created_at"`
 }
 
-// SessionLog 完整的会话过程日志（会话结束时生成）
-type SessionLog struct {
-	ID        uint `gorm:"primaryKey" json:"id"`
-	UserID    uint `gorm:"index" json:"user_id"`
-	SessionID uint `gorm:"index;unique" json:"session_id"` // 一个会话对应一条日志
-	KbID      uint `json:"kb_id"`
-	// 时间统计
-	StartedAt   time.Time `json:"started_at"`
-	EndedAt     time.Time `json:"ended_at"`
-	DurationSec int       `json:"duration_sec"` // 会话时长（秒）
-	// 答题统计
-	TotalQuestions int     `json:"total_questions"` // 总出题数
-	CorrectAnswers int     `json:"correct_answers"` // 答对数
-	WrongAnswers   int     `json:"wrong_answers"`   // 答错数
-	CorrectRate    float32 `json:"correct_rate"`    // 正确率 0-100
-	// 知识点统计
-	KnowledgePoints json.RawMessage `gorm:"type:jsonb" json:"knowledge_points,omitempty"` // 练过的知识点列表
-	// 题型统计
-	QuestionTypes json.RawMessage `gorm:"type:jsonb" json:"question_types,omitempty"` // 题型分布
-	// 难度统计
-	DifficultyStats json.RawMessage `gorm:"type:jsonb" json:"difficulty_stats,omitempty"` // 难度分布
-	// 完整过程
-	ProcessFlow    json.RawMessage `gorm:"type:jsonb" json:"process_flow,omitempty"`  // 每一步的决策与结果
-	Summary        string          `gorm:"type:text" json:"summary,omitempty"`        // 最终总结
-	Recommendation string          `gorm:"type:text" json:"recommendation,omitempty"` // 推荐下一步
-	CreatedAt      time.Time       `json:"created_at"`
-}
-
-// SessionProcess 会话过程中的一个步骤记录
-type SessionProcess struct {
-	StepNumber  int             `json:"step"`                  // 第几步
-	Timestamp   time.Time       `json:"timestamp"`             // 时间戳
-	UserMessage string          `json:"user_message"`          // 用户消息摘要
-	AgentIntent string          `json:"agent_intent"`          // Agent 意图
-	ToolCalls   []string        `json:"tool_calls"`            // 工具调用
-	Result      string          `json:"result"`                // 结果摘要
-	QuestionID  *uint           `json:"question_id,omitempty"` // 如果出题，记录题目ID
-	IsCorrect   *bool           `json:"is_correct,omitempty"`  // 如果答题，记录对错
-	Frames      json.RawMessage `json:"frames,omitempty"`      // SSE 帧
-}
-
 // SessionSummary 会话列表项（对话历史侧栏）。
 type SessionSummary struct {
 	ID           uint      `json:"id"`

@@ -163,7 +163,9 @@ func (h *QuizHandler) Chat(c *gin.Context) {
 		return
 	}
 
-	frames, err := h.svc.Chat(c.Request.Context(), c.GetUint("user_id"), in.SessionID, in.Message)
+	// 流式驱动 Agent：帧通道实时推送（结构性帧 + 自由文本 delta）
+	// out 是 agent 与 HTTP 层之间的内存通道，写入只是入队
+	framesCh, err := h.svc.ChatStream(c.Request.Context(), c.GetUint("user_id"), in.SessionID, in.Message)
 	if err != nil {
 		if errors.Is(err, repo.ErrNotFound) {
 			resp.Fail(c, resp.CodeNotFound, "会话不存在，请先创建模拟测试会话")
@@ -173,19 +175,23 @@ func (h *QuizHandler) Chat(c *gin.Context) {
 		return
 	}
 
-	// SSE 逐帧推送
+	// SSE 逐帧实时推送（阻塞读通道，帧产出即下推）
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
+	//c.Stream 循环消费 framesCh，直到通道关闭（回合结束）或客户端断开。
 	c.Stream(func(w io.Writer) bool {
-		for _, f := range frames {
-			if f == nil {
-				continue
-			}
-			c.SSEvent("message", f)
+		f, ok := <-framesCh
+		if !ok {
+			// 通道关闭 → 回合结束
+			c.SSEvent("message", gin.H{"kind": "done"})
+			return false
 		}
-		// 结束帧
-		c.SSEvent("message", gin.H{"kind": "done"})
-		return false
+		if f == nil {
+			return true
+		}
+		//把 Frame 序列化成一个 SSE event 发到前端，前端按 kind 渲染
+		c.SSEvent("message", f)
+		return true
 	})
 }

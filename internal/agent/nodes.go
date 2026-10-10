@@ -30,7 +30,7 @@ func (a *Agent) noLLMFrame(in ChatInput) *Frame {
 func (a *Agent) checkKb(ctx context.Context, c *Ctx) error {
 	in := c.In
 
-	sess, err := a.repo.GetSession(ctx, in.UserID, in.SessionID)
+	sess, err := c.tk.repo.GetSession(ctx, in.UserID, in.SessionID)
 	if err != nil {
 		if errors.Is(err, repo.ErrNotFound) {
 			c.Frames = []*Frame{{
@@ -44,7 +44,7 @@ func (a *Agent) checkKb(ctx context.Context, c *Ctx) error {
 	}
 	c.Session = &practiceSessionView{ID: sess.ID, State: sess.State, LastQuestionID: sess.LastQuestionID}
 
-	kb, err := a.kbRepo.GetBaseWithMeta(ctx, in.UserID, sess.KbID)
+	kb, err := c.tk.kbRepo.GetBaseWithMeta(ctx, in.UserID, sess.KbID)
 	if err != nil {
 		if errors.Is(err, repo.ErrNotFound) {
 			c.Frames = []*Frame{{
@@ -63,17 +63,19 @@ func (a *Agent) checkKb(ctx context.Context, c *Ctx) error {
 		gradeName = kb.Grade.Name
 	}
 	subjectName := ""
+	subjectCode := ""
 	if kb.Subject != nil {
 		subjectName = kb.Subject.Name
+		subjectCode = kb.Subject.Code
 	}
-	c.KB = &kbView{ID: kb.ID, GradeName: gradeName, SubjectName: subjectName}
+	c.KB = &kbView{ID: kb.ID, GradeName: gradeName, SubjectName: subjectName, SubjectCode: subjectCode}
 	return nil
 }
 
 // buildCtx 读最近 N 轮 ChatTurn，组装 LLM 上下文历史链（不含本轮 user 消息）。
 // 本轮消息由 Agent 作为 User 单独拼接；内部子调用与主循环共用同一份 History。
 func (a *Agent) buildCtx(ctx context.Context, c *Ctx) error {
-	turns, err := a.repo.ListTurns(ctx, c.Session.ID, maxTurns)
+	turns, err := c.tk.repo.ListTurns(ctx, c.Session.ID, maxTurns)
 	if err != nil {
 		return err
 	}
@@ -91,9 +93,9 @@ func (a *Agent) persist(ctx context.Context, c *Ctx) {
 	if c.Session == nil {
 		return
 	}
-	sess, err := a.repo.GetSession(ctx, c.In.UserID, c.Session.ID)
+	sess, err := c.tk.repo.GetSession(ctx, c.In.UserID, c.Session.ID)
 	if err != nil {
-		a.log.Warn("reload session for persist failed", zap.Error(err))
+		c.tk.log.Warn("reload session for persist failed", zap.Error(err))
 	} else {
 		changed := false
 		if c.State != "" && c.State != sess.State {
@@ -106,8 +108,8 @@ func (a *Agent) persist(ctx context.Context, c *Ctx) {
 			changed = true
 		}
 		if changed {
-			if err := a.repo.UpdateSession(ctx, sess); err != nil {
-				a.log.Warn("persist session state failed", zap.Error(err))
+			if err := c.tk.repo.UpdateSession(ctx, sess); err != nil {
+				c.tk.log.Warn("persist session state failed", zap.Error(err))
 			}
 		}
 	}
@@ -147,12 +149,7 @@ func (a *Agent) persist(ctx context.Context, c *Ctx) {
 	}
 
 	turns := []model.ChatTurn{turn}
-	if err := a.repo.AddTurns(ctx, turns); err != nil {
-		a.log.Warn("persist assistant turns failed", zap.Error(err))
+	if err := c.tk.repo.AddTurns(ctx, turns); err != nil {
+		c.tk.log.Warn("persist assistant turns failed", zap.Error(err))
 	}
-}
-
-// gsTag 年级-学科标签（prompt 注入）。
-func (a *Agent) gsTag(kb *kbView) string {
-	return gradeSubject(kb.GradeName, kb.SubjectName)
 }

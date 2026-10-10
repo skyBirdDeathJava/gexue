@@ -6,8 +6,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cloudwego/eino/adk"
 	einoModel "github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
+	"go.uber.org/zap"
 
 	"gexue/internal/model"
 	"gexue/internal/repo"
@@ -42,52 +44,27 @@ func TestRuleCheck(t *testing.T) {
 	}
 }
 
-func TestTrimJSON(t *testing.T) {
-	cases := []struct{ in, want string }{
-		{"  {\"a\":1}  ", "{\"a\":1}"},
-		{"```json\n{\"a\":1}\n```", "{\"a\":1}"},
-		{"前文{\"a\":1}后文", "{\"a\":1}"},
-	}
-	for _, c := range cases {
-		if got := trimJSON(c.in); got != c.want {
-			t.Errorf("trimJSON(%q)=%q, want %q", c.in, got, c.want)
-		}
-	}
-}
-
 func TestParseToolArgs(t *testing.T) {
-	v, errMsg := parseToolArgs[toolFollowupArgs](`{"content":"再想想","difficulty":2,"qtype":"fill"}`)
+	v, errMsg := parseToolArgs[toolSaveFollowupArgs](`{"content":"再想想","difficulty":2,"qtype":"fill"}`)
 	if errMsg != "" {
 		t.Fatalf("unexpected parse err: %s", errMsg)
 	}
 	if v.Content != "再想想" || v.Difficulty != 2 || v.QType != "fill" {
 		t.Errorf("parse mismatch: %+v", v)
 	}
-	if _, errMsg := parseToolArgs[toolFollowupArgs](`{bad json`); errMsg == "" {
+	if _, errMsg := parseToolArgs[toolSaveFollowupArgs](`{bad json`); errMsg == "" {
 		t.Error("expected parse error message on bad json")
 	}
 }
 
-// ---- Agent 主循环单测（可返回工具调用的 fake ChatModel，无 DB） ----
+// ---- 工具处理器单测（fake ChatModel，无 DB/网络） ----
 
-// fakeModel 可控地返回「自由文本」或「工具调用」，用于驱动主循环。
-// turn 依次返回列表中的响应；耗尽后返回最后一个。
+// fakeModel 可控地返回自由文本，用于内部子调用（当前工具不再调 LLM，保留用于构造）。
 type fakeModel struct {
-	gen   string            // 自由文本回复（Generate 默认）
-	turns []*schema.Message // 按调用顺序返回的响应
-	idx   int
-	binds []*schema.ToolInfo // 记录 BindTools 收到的工具
+	gen string
 }
 
 func (f *fakeModel) Generate(_ context.Context, _ []*schema.Message, _ ...einoModel.Option) (*schema.Message, error) {
-	if len(f.turns) > 0 {
-		if f.idx < len(f.turns) {
-			m := f.turns[f.idx]
-			f.idx++
-			return m, nil
-		}
-		return f.turns[len(f.turns)-1], nil
-	}
 	return &schema.Message{Role: schema.Assistant, Content: f.gen}, nil
 }
 
@@ -95,103 +72,58 @@ func (f *fakeModel) Stream(_ context.Context, _ []*schema.Message, _ ...einoMode
 	return schema.StreamReaderFromArray([]*schema.Message{{Role: schema.Assistant, Content: f.gen}}), nil
 }
 
-func (f *fakeModel) BindTools(tools []*schema.ToolInfo) error { f.binds = tools; return nil }
+func (f *fakeModel) BindTools(tools []*schema.ToolInfo) error { return nil }
 
-// toolMsg 构造一条带工具调用的 assistant 消息。
-func toolMsg(name, args string) *schema.Message {
-	return &schema.Message{
-		Role: schema.Assistant,
-		ToolCalls: []schema.ToolCall{{
-			ID: "call-1",
-			Function: schema.FunctionCall{
-				Name:      name,
-				Arguments: args,
-			},
-		}},
-	}
-}
-
-// testAgent 构造 tools 已注册、llm 为 fake 的 Agent（repo/emb 为空，避免触碰 DB/网络）。
-// 注意：fake model 无实际工具执行能力，主循环测试直接断言工具调用被正确执行/产出帧。
+// testAgent 构造 Model 为 fake 的 Agent（repo/emb 为空，避免触碰 DB/网络）。
 func testAgent(m *fakeModel) *Agent {
-	a := &Agent{
-		repo:   repo.NewQuizRepo(nil),
-		kbRepo: repo.NewKnowledgeRepo(nil),
-		log:    nil,
-		tools:  map[string]toolHandler{},
+	return &Agent{
+		ChatModelAgentConfig: &adk.ChatModelAgentConfig{Model: m},
+		tk: &toolkit{
+			repo:   repo.NewQuizRepo(nil),
+			kbRepo: repo.NewKnowledgeRepo(nil),
+			log:    zap.NewNop(),
+		},
 	}
-	a.registerTools()
-	a.llm = m
-	return a
 }
 
-// newLoopCtx 构造一个已通过前置检查的 Ctx（有 Session/KB）。
-func newLoopCtx(msg string) *Ctx {
+// newCtx 构造一个已通过前置检查的 Ctx（有 Session/KB + 领域依赖）。
+func newCtx(msg string) *Ctx {
 	qid := uint(1)
 	return &Ctx{
-		In:      ChatInput{UserID: 1, SessionID: 1, Message: msg},
+		In: ChatInput{UserID: 1, SessionID: 1, Message: msg},
+		tk: &toolkit{
+			repo:   repo.NewQuizRepo(nil),
+			kbRepo: repo.NewKnowledgeRepo(nil),
+			log:    zap.NewNop(),
+		},
 		Session: &practiceSessionView{ID: 1, State: "idle", LastQuestionID: &qid},
-		KB:      &kbView{ID: 1, GradeName: "3年级", SubjectName: "数学"},
+		KB:      &kbView{ID: 1, GradeName: "3年级", SubjectName: "数学", SubjectCode: "math"},
 	}
 }
 
-// TestLoopFreeTextReply 模型直接给自由文本（闲聊）→ 产出 chitchat 回复帧。
-func TestLoopFreeTextReply(t *testing.T) {
-	a := testAgent(&fakeModel{gen: "哈哈，我们继续学习吧～"})
-	c := newLoopCtx("今天天气真好")
-	a.runLoop(context.Background(), c)
-
-	if len(c.Frames) != 1 || c.Frames[0].Kind != FrameChitChat {
-		t.Fatalf("expected one chitchat frame, got %+v", c.Frames)
-	}
-	if !strings.Contains(c.Frames[0].Text, "继续学习") {
-		t.Errorf("unexpected reply: %q", c.Frames[0].Text)
-	}
-}
-
-// TestLoopToolThenFreeText 模型先调工具（这里工具执行可能因 DB 为空失败），随后给出自由文本。
-// 验证循环不因工具失败而崩溃，且自由文本能成为回复。
-func TestLoopToolThenFreeText(t *testing.T) {
-	m := &fakeModel{turns: []*schema.Message{
-		toolMsg("follow_up", `{"content":"先想想 5×2 等于多少？","mode":"hint","difficulty":2,"qtype":"fill"}`),
-		{Content: "想好了吗？"},
-	}}
-	a := testAgent(m)
-	c := newLoopCtx("24")
-	a.runLoop(context.Background(), c)
-
-	// follow_up 无需 DB，直接产出 followup 帧；后续自由文本因已有帧被丢弃
-	if len(c.Frames) != 1 || c.Frames[0].Kind != FrameFollowup {
-		t.Fatalf("expected followup frame, got %+v", c.Frames)
-	}
-	if c.Frames[0].Text != "先想想 5×2 等于多少？" {
-		t.Errorf("unexpected followup text: %q", c.Frames[0].Text)
-	}
-}
-
-// TestToolFollowup 直接测 follow_up 工具：产出 followup 帧并携带难度/题型（由 Agent 按作答选择）。
-func TestToolFollowup(t *testing.T) {
+// TestSaveFollowup 直接测 save_followup 工具：产出 followup 帧并携带难度/题型。
+func TestSaveFollowup(t *testing.T) {
 	a := testAgent(&fakeModel{})
-	c := newLoopCtx("24")
-	status := a.toolFollowup(context.Background(), c, `{"content":"答对啦！再试试两位数的乘法？","mode":"extend","difficulty":4,"qtype":"select"}`)
+	c := newCtx("24")
+	status := a.toolSaveFollowup(context.Background(), c, `{"content":"答对啦！再试试两位数的乘法？","mode":"extend","difficulty":4,"qtype":"select"}`)
 
 	if strings.Contains(status, "失败") {
-		t.Fatalf("followup should not fail: %s", status)
+		t.Fatalf("save_followup should not fail: %s", status)
 	}
 	if len(c.Frames) != 1 || c.Frames[0].Kind != FrameFollowup {
 		t.Fatalf("expected followup frame, got %+v", c.Frames)
 	}
 	f := c.Frames[0]
 	if f.Difficulty != 4 || f.QType != "select" {
-		t.Errorf("followup should carry difficulty/qtype chosen by agent: %+v", f)
+		t.Errorf("followup should carry difficulty/qtype: %+v", f)
 	}
 }
 
-// TestToolFollowupEmptyContent 追问缺少内容 → 返回错误串（模型可自我纠正），不产出帧。
-func TestToolFollowupEmptyContent(t *testing.T) {
+// TestSaveFollowupEmptyContent 追问缺少内容 → 返回错误串，不产出帧。
+func TestSaveFollowupEmptyContent(t *testing.T) {
 	a := testAgent(&fakeModel{})
-	c := newLoopCtx("不知道")
-	status := a.toolFollowup(context.Background(), c, `{}`)
+	c := newCtx("不知道")
+	status := a.toolSaveFollowup(context.Background(), c, `{}`)
 	if !strings.Contains(status, "content") {
 		t.Errorf("expected missing-content error, got %q", status)
 	}
@@ -200,24 +132,24 @@ func TestToolFollowupEmptyContent(t *testing.T) {
 	}
 }
 
-// TestToolHelp 直接测 help_solve 工具：产出 help 帧。
-func TestToolHelp(t *testing.T) {
-	a := testAgent(&fakeModel{gen: "先算乘法再算加法，答案是 24。"})
-	c := newLoopCtx("3+5×2=？")
-	status := a.toolHelp(context.Background(), c, `{"question":"3+5×2=？"}`)
+// TestSaveSolution 直接测 save_solution 工具：产出 help 帧（内容由专家撰写后传入）。
+func TestSaveSolution(t *testing.T) {
+	a := testAgent(&fakeModel{})
+	c := newCtx("3+5×2=？")
+	status := a.toolSaveSolution(context.Background(), c, `{"text":"先算乘法再算加法，答案是 24。"}`)
 	if strings.Contains(status, "失败") {
-		t.Fatalf("help should not fail: %s", status)
+		t.Fatalf("save_solution should not fail: %s", status)
 	}
 	if len(c.Frames) != 1 || c.Frames[0].Kind != FrameHelp {
 		t.Fatalf("expected help frame, got %+v", c.Frames)
 	}
 }
 
-// TestToolGenerateMissingPoint 出题缺知识点 → 返回错误串，不产出题帧。
-func TestToolGenerateMissingPoint(t *testing.T) {
+// TestSaveQuestionsMissingPoint 保存题目缺知识点 → 返回错误串，不产出题帧。
+func TestSaveQuestionsMissingPoint(t *testing.T) {
 	a := testAgent(&fakeModel{})
-	c := newLoopCtx("出几道题")
-	status := a.toolGenerate(context.Background(), c, `{"difficulty":3}`)
+	c := newCtx("出几道题")
+	status := a.toolSaveQuestions(context.Background(), c, `{"difficulty":3}`)
 	if !strings.Contains(status, "knowledge_point") {
 		t.Errorf("expected missing knowledge_point error, got %q", status)
 	}
@@ -226,24 +158,49 @@ func TestToolGenerateMissingPoint(t *testing.T) {
 	}
 }
 
-// TestNewAgentNoKey 无 API Key 时 llm 为 nil，工具注册好，可编译可调用（入口兜底）。
+// ---- Agent 构造单测 ----
+
+// TestNewAgentNoKey 无 API Key 时 llm 为 nil、路由未构建，可编译可调用（入口兜底）。
 func TestNewAgentNoKey(t *testing.T) {
 	a, err := NewAgent(repo.NewQuizRepo(nil), repo.NewKnowledgeRepo(nil), nil, nil, LLMConfig{}, nil)
 	if err != nil {
 		t.Fatalf("NewAgent err: %v", err)
 	}
-	if a.llm != nil {
-		t.Error("llm should be nil without API key")
+	if a.Model != nil {
+		t.Error("Model should be nil without API key")
 	}
-	if len(a.tools) != 5 || len(a.toolInfos) != 5 {
-		t.Errorf("expected 5 tools registered, got tools=%d infos=%d", len(a.tools), len(a.toolInfos))
+	if a.router != nil {
+		t.Error("router should be nil without LLM")
+	}
+	if len(a.toolInfos()) != 8 {
+		t.Errorf("expected 8 tool infos, got %d", len(a.toolInfos()))
+	}
+}
+
+// TestNewAgentWithKey 有 API Key 时构建 ADK 路由（专家 + 每学科路由），无网络调用。
+func TestNewAgentWithKey(t *testing.T) {
+	a, err := NewAgent(repo.NewQuizRepo(nil), repo.NewKnowledgeRepo(nil), nil, nil,
+		LLMConfig{Provider: "deepseek", APIKey: "test-key", Model: "deepseek-chat"}, nil)
+	if err != nil {
+		t.Fatalf("NewAgent err: %v", err)
+	}
+	if a.Model == nil {
+		t.Error("Model should be built with API key")
+	}
+	if a.router == nil {
+		t.Fatal("router should be built with LLM")
+	}
+	for _, code := range []string{"math", "yuwen", "english", "default"} {
+		if a.router.resolve(code) == nil {
+			t.Errorf("router should resolve %s", code)
+		}
 	}
 }
 
 // TestToolInfosSerializable 工具参数 schema 可序列化为 JSON（供大模型解析）。
 func TestToolInfosSerializable(t *testing.T) {
 	a, _ := NewAgent(repo.NewQuizRepo(nil), repo.NewKnowledgeRepo(nil), nil, nil, LLMConfig{}, nil)
-	for _, ti := range a.toolInfos {
+	for _, ti := range a.toolInfos() {
 		s, err := ti.ParamsOneOf.ToJSONSchema()
 		if err != nil {
 			t.Fatalf("tool %s ToJSONSchema err: %v", ti.Name, err)
@@ -251,5 +208,218 @@ func TestToolInfosSerializable(t *testing.T) {
 		if _, err := json.Marshal(s); err != nil {
 			t.Fatalf("tool %s schema marshal err: %v", ti.Name, err)
 		}
+	}
+}
+
+// TestCtxEmit 帧在无 sink 时只入列；有 sink 时同时推送通道（流式）。
+func TestCtxEmit(t *testing.T) {
+	c := &Ctx{}
+	c.emit(&Frame{Kind: FrameChitChat, Text: "hi"})
+	if len(c.Frames) != 1 {
+		t.Fatalf("expected 1 frame, got %d", len(c.Frames))
+	}
+
+	out := make(chan *Frame, 1)
+	c2 := &Ctx{sink: out}
+	c2.emit(&Frame{Kind: FrameChitChat, Text: "hi"})
+	select {
+	case f := <-out:
+		if f.Text != "hi" {
+			t.Errorf("unexpected streamed frame: %+v", f)
+		}
+	default:
+		t.Error("expected frame pushed to sink")
+	}
+}
+
+// TestToolAdapterTrace 工具级 trace：toolAdapter 执行后把工具名/参数/结果记入 Ctx，供 persist 落库。
+func TestToolAdapterTrace(t *testing.T) {
+	a := testAgent(&fakeModel{})
+	infos, handlers := a.toolInfosAndHandlers()
+
+	var fInfo *schema.ToolInfo
+	var fHandler toolHandler
+	for _, ti := range infos {
+		if ti.Name == "save_followup" {
+			fInfo = ti
+			fHandler = handlers[ti.Name]
+		}
+	}
+	if fInfo == nil {
+		t.Fatal("save_followup tool not found")
+	}
+
+	adapter := &toolAdapter{info: fInfo, run: fHandler}
+	c := newCtx("24")
+	ctx := withCtx(context.Background(), c)
+
+	if _, err := adapter.InvokableRun(ctx, `{"content":"再想想","mode":"hint"}`); err != nil {
+		t.Fatalf("InvokableRun err: %v", err)
+	}
+	if len(c.ToolCalls) != 1 || c.ToolCalls[0] != "save_followup" {
+		t.Errorf("expected save_followup in ToolCalls, got %v", c.ToolCalls)
+	}
+	if len(c.ToolResults) != 1 || !strings.Contains(c.ToolResults[0], "save_followup") {
+		t.Errorf("expected save_followup trace in ToolResults, got %v", c.ToolResults)
+	}
+}
+
+// ---- transfer 集成测试：路由 SetSubAgents 移交专家，专家 ReAct 产出帧 ----
+
+// scriptedModel 按调用顺序返回预编排消息（路由→专家），用于验证 transfer 事件流。
+// 顺序：路由 1 次（transfer_to_agent 工具调用）→ 专家 2 次（原子工具调用 + 最终文本）。
+type scriptedModel struct {
+	steps []*schema.Message
+	pos   int
+}
+
+func (m *scriptedModel) Generate(_ context.Context, _ []*schema.Message, _ ...einoModel.Option) (*schema.Message, error) {
+	return m.next(), nil
+}
+
+func (m *scriptedModel) Stream(_ context.Context, _ []*schema.Message, _ ...einoModel.Option) (*schema.StreamReader[*schema.Message], error) {
+	return schema.StreamReaderFromArray([]*schema.Message{m.next()}), nil
+}
+
+func (m *scriptedModel) BindTools(_ []*schema.ToolInfo) error { return nil }
+
+func (m *scriptedModel) next() *schema.Message {
+	if m.pos >= len(m.steps) {
+		return &schema.Message{Role: schema.Assistant, Content: "好的"} // 兜底，防意外多轮挂死
+	}
+	msg := m.steps[m.pos]
+	m.pos++
+	return msg
+}
+
+// toolCallMsg 构造一次工具调用消息（arguments 为 JSON 字符串）。
+func toolCallMsg(name, args string) *schema.Message {
+	return &schema.Message{
+		Role: schema.Assistant,
+		ToolCalls: []schema.ToolCall{{
+			ID:       "call_0",
+			Type:     "function",
+			Function: schema.FunctionCall{Name: name, Arguments: args},
+		}},
+	}
+}
+
+// transferTestAgent 构造已 buildRouter 的 Agent（Model 为可编排的 scriptedModel）。
+// 复刻 NewAgent：配置模板 + toolkit + buildExpertConfigs + buildRouter。
+func transferTestAgent(t *testing.T, m *scriptedModel) *Agent {
+	t.Helper()
+	a := &Agent{
+		ChatModelAgentConfig: &adk.ChatModelAgentConfig{
+			Name:          "default_router",
+			Description:   "学习辅导路由：识别学生意图，派发出题/判分/追问/解题/总结专家",
+			Instruction:   routerInstruction("学习"),
+			MaxIterations: maxAgentIterations,
+		},
+		tk: &toolkit{
+			repo:   repo.NewQuizRepo(nil),
+			kbRepo: repo.NewKnowledgeRepo(nil),
+			log:    zap.NewNop(),
+		},
+	}
+	a.Model = m
+	if err := a.buildExpertConfigs(); err != nil {
+		t.Fatalf("buildExpertConfigs: %v", err)
+	}
+	if err := a.buildRouter(context.Background()); err != nil {
+		t.Fatalf("buildRouter: %v", err)
+	}
+	return a
+}
+
+// TestParseTransferTarget 直接测 transfer 意图解析（参数格式由库固定为 {"agent_name": "..."}）。
+func TestParseTransferTarget(t *testing.T) {
+	// 命中：transfer_to_agent 参数取 agent_name
+	mv := &adk.MessageVariant{Message: &schema.Message{
+		Role: schema.Assistant,
+		ToolCalls: []schema.ToolCall{{
+			ID: "c1", Type: "function",
+			Function: schema.FunctionCall{Name: adk.TransferToAgentToolName, Arguments: `{"agent_name":"generate"}`},
+		}},
+	}}
+	if got := parseTransferTarget(mv); got != "generate" {
+		t.Errorf("parseTransferTarget = %q, want generate", got)
+	}
+	// 未命中：普通工具调用 → 空串
+	mv2 := &adk.MessageVariant{Message: &schema.Message{
+		Role: schema.Assistant,
+		ToolCalls: []schema.ToolCall{{
+			ID: "c2",
+			Function: schema.FunctionCall{Name: "search_kb", Arguments: `{"q":"加法"}`},
+		}},
+	}}
+	if got := parseTransferTarget(mv2); got != "" {
+		t.Errorf("parseTransferTarget = %q, want empty for non-transfer", got)
+	}
+	// 无工具调用 → 空串
+	mv3 := &adk.MessageVariant{Message: &schema.Message{Role: schema.Assistant, Content: "你好"}}
+	if got := parseTransferTarget(mv3); got != "" {
+		t.Errorf("parseTransferTarget = %q, want empty for plain text", got)
+	}
+}
+
+// TestRouterTransferFollowup 集成测试（流式）：路由 transfer_to_agent 移交 followup 专家，
+// 验证 ① 意图 = transfer 目标专家 ② 专家帧经 sink 实时推送 ③ 工具日志去重 ④ 最终文本 = 专家末尾文本。
+func TestRouterTransferFollowup(t *testing.T) {
+	a := transferTestAgent(t, &scriptedModel{steps: []*schema.Message{
+		toolCallMsg(adk.TransferToAgentToolName, `{"agent_name":"followup"}`),
+		toolCallMsg("save_followup", `{"content":"再想想，5 可以分成几和几？","mode":"hint","difficulty":2,"qtype":"fill"}`),
+		{Role: schema.Assistant, Content: "再想想，5 可以分成几和几？"},
+	}})
+
+	router := a.router.resolve("math")
+	if router == nil {
+		t.Fatal("math router should resolve")
+	}
+
+	c := newCtx("不知道怎么做")
+	msgs := a.runtimeMessages(c)
+	out := make(chan *Frame, 64)
+	c.sink = out // 与真实 ChatStream 一致：结构性帧经 sink 实时推送
+	runCtx := withCtx(context.Background(), c)
+
+	finalText := a.streamRouter(runCtx, c, router, msgs, out)
+	close(out)
+
+	// ① 意图 = transfer 目标专家
+	if c.AgentIntent != "followup" {
+		t.Errorf("AgentIntent = %q, want followup", c.AgentIntent)
+	}
+	// ② 专家移交后产出 followup 帧（sink 收到 + c.Frames 记到）
+	sawFollowup := false
+	for f := range out {
+		if f.Kind == FrameFollowup {
+			sawFollowup = true
+		}
+	}
+	if !sawFollowup {
+		t.Error("expected followup frame streamed to sink")
+	}
+	if len(c.Frames) != 1 || c.Frames[0].Kind != FrameFollowup {
+		t.Fatalf("expected 1 followup frame in c.Frames, got %+v", c.Frames)
+	}
+	if !strings.Contains(c.Frames[0].Text, "5 可以分成几和几") {
+		t.Errorf("followup frame text mismatch: %q", c.Frames[0].Text)
+	}
+	// ③ 工具日志去重：路由 transfer 一次 + 专家原子工具一次（原子工具由 toolAdapter 内部记录）
+	want := []string{adk.TransferToAgentToolName, "save_followup"}
+	if len(c.ToolCalls) != len(want) {
+		t.Fatalf("ToolCalls = %v, want %v", c.ToolCalls, want)
+	}
+	for i, w := range want {
+		if c.ToolCalls[i] != w {
+			t.Errorf("ToolCalls[%d] = %q, want %q", i, c.ToolCalls[i], w)
+		}
+	}
+	if len(c.ToolResults) != 2 || !strings.Contains(c.ToolResults[0], adk.TransferToAgentToolName) {
+		t.Errorf("ToolResults should have transfer trace first, got %v", c.ToolResults)
+	}
+	// ④ 最终自由文本 = 专家 ReAct 末尾文本
+	if got := strings.TrimSpace(finalText); got != "再想想，5 可以分成几和几？" {
+		t.Errorf("finalText = %q, want expert final text", got)
 	}
 }

@@ -94,10 +94,6 @@ func (r *KnowledgeRepo) DeleteBase(ctx context.Context, userID, kbID uint) error
 
 // ---- 知识点 ----
 
-func (r *KnowledgeRepo) CreatePoint(ctx context.Context, kp *model.KnowledgePoint) error {
-	return r.db.WithContext(ctx).Create(kp).Error
-}
-
 // ListPoints 返回知识库下知识点（扁平），由 service 组树。
 func (r *KnowledgeRepo) ListPoints(ctx context.Context, kbID uint) ([]model.KnowledgePoint, error) {
 	var kps []model.KnowledgePoint
@@ -113,37 +109,6 @@ func (r *KnowledgeRepo) SaveChunks(ctx context.Context, chunks []model.Knowledge
 		return nil
 	}
 	return r.db.WithContext(ctx).Create(&chunks).Error
-}
-
-// ListChunksByPoint 某知识点下的全部分块（按 seq 排序）。
-func (r *KnowledgeRepo) ListChunksByPoint(ctx context.Context, kpID uint) ([]model.KnowledgeChunk, error) {
-	var chunks []model.KnowledgeChunk
-	err := r.db.WithContext(ctx).Where("kp_id = ?", kpID).Order("seq").Find(&chunks).Error
-	return chunks, err
-}
-
-// DeleteChunk 删除某分块（校验 kb + 知识点归属）。
-func (r *KnowledgeRepo) DeleteChunk(ctx context.Context, kbID, kpID, chunkID uint) error {
-	res := r.db.WithContext(ctx).Where("id = ? AND kb_id = ? AND kp_id = ?", chunkID, kbID, kpID).Delete(&model.KnowledgeChunk{})
-	if res.Error != nil {
-		return res.Error
-	}
-	if res.RowsAffected == 0 {
-		return ErrNotFound
-	}
-	return nil
-}
-
-// DeletePoint 删除知识点（级联其全部分块）。
-func (r *KnowledgeRepo) DeletePoint(ctx context.Context, kbID, kpID uint) error {
-	res := r.db.WithContext(ctx).Where("id = ? AND kb_id = ?", kpID, kbID).Delete(&model.KnowledgePoint{})
-	if res.Error != nil {
-		return res.Error
-	}
-	if res.RowsAffected == 0 {
-		return ErrNotFound
-	}
-	return r.db.WithContext(ctx).Where("kp_id = ?", kpID).Delete(&model.KnowledgeChunk{}).Error
 }
 
 // ListFiles 按 file_name 聚合知识库文档。

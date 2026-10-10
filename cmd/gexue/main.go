@@ -218,9 +218,10 @@ func initDB(cfg *config.Config, logger *zap.Logger) *gorm.DB {
 		}
 	*/
 
-	// HNSW 索引 AutoMigrate 不会建，须显式执行（幂等）
+	// HNSW 索引 AutoMigrate 不会建，须显式执行（幂等）。
+	// 索引名与 SCHEMA.sql 保持一致，避免重复建索引。
 	if err := db.Exec(
-		"CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_vec " +
+		"CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_content_vec_hnsw " +
 			"ON knowledge_chunks USING hnsw (content_vec vector_cosine_ops)",
 	).Error; err != nil {
 		logger.Warn("create hnsw index failed", zap.Error(err))

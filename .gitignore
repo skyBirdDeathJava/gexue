@@ -26,9 +26,13 @@ dist/
 
 # ---------- IDE / 编辑器配置 ----------
 .idea/
+.idea_backup/
 *.iml
 *.xml
 projectFilesBackup*/
+
+# ---------- 本地下载的监控工具二进制（不入库，配置在 configs/） ----------
+tools/
 
 # ---------- 其他 ----------
 about-me.md

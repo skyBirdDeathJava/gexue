@@ -72,39 +72,6 @@ func (s *KnowledgeService) CreateBase(ctx context.Context, userID uint, name str
 	return kb, nil
 }
 
-// CreateChunks 录入：校验 KB 归属 → 分块 → 向量化 → 入库（旧 API，保留兼容）。
-// Deprecated: 使用 CreateChunksFromFile 替代，用户无需手动指定知识点。
-func (s *KnowledgeService) CreateChunks(ctx context.Context, userID, kbID, kpID uint, content, source string) ([]model.KnowledgeChunk, error) {
-	if _, err := s.repo.GetBase(ctx, userID, kbID); err != nil {
-		return nil, err
-	}
-	if source == "" {
-		source = "manual"
-	}
-	parts := chunk.Split(content, s.maxChunk, s.overlap)
-	if len(parts) == 0 {
-		return nil, nil
-	}
-	vecs, err := s.emb.Embed(ctx, parts)
-	if err != nil {
-		return nil, err
-	}
-	chunks := make([]model.KnowledgeChunk, 0, len(parts))
-	for i, p := range parts {
-		chunks = append(chunks, model.KnowledgeChunk{
-			KbID:        kbID,
-			Seq:         i,
-			ContentText: p,
-			ContentVec:  pgvector.NewVector(vecs[i]),
-			Source:      source,
-		})
-	}
-	if err := s.repo.SaveChunks(ctx, chunks); err != nil {
-		return nil, err
-	}
-	return chunks, nil
-}
-
 // CreateChunksFromFile 从文件上传：
 // 1. 原始文件上传到 OSS
 // 2. 提取文本 → 分块 → 向量化

@@ -141,9 +141,9 @@ func (s *QuizService) GetSession(ctx context.Context, userID, sessionID uint) (*
 	return sess, turns, nil
 }
 
-// Chat 驱动 Agent 对话主图。
-// 用户消息先行落库（保证上下文记忆），assistant 帧由 Agent 内落库。
-func (s *QuizService) Chat(ctx context.Context, userID, sessionID uint, message string) ([]*agent.Frame, error) {
+// ChatStream 流式驱动 Agent 对话：返回帧通道，实时推送结构性帧 + 自由文本 delta。
+// 用户消息先行落库；assistant 帧由 Agent 内落库。通道关闭即回合结束。
+func (s *QuizService) ChatStream(ctx context.Context, userID, sessionID uint, message string) (<-chan *agent.Frame, error) {
 	if _, err := s.repo.GetSession(ctx, userID, sessionID); err != nil {
 		return nil, err
 	}
@@ -151,7 +151,7 @@ func (s *QuizService) Chat(ctx context.Context, userID, sessionID uint, message 
 	if err := s.repo.AddTurns(ctx, []model.ChatTurn{turn}); err != nil {
 		return nil, err
 	}
-	return s.agent.Chat(ctx, agent.ChatInput{
+	return s.agent.ChatStream(ctx, agent.ChatInput{
 		UserID:    userID,
 		SessionID: sessionID,
 		Message:   message,
