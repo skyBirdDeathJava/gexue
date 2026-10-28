@@ -585,3 +585,40 @@ func TestParseDSMLCallVariant(t *testing.T) {
 		t.Fatalf("call variant: name=%q args=%q ok=%v", name, args, ok)
 	}
 }
+
+// TestIsDirtyTurn 脏对话过滤：DSML 泄漏 / 空内容 → 过滤；正常 / user 消息 → 保留。
+func TestIsDirtyTurn(t *testing.T) {
+	cases := []struct {
+		name string
+		turn model.ChatTurn
+		want bool
+	}{
+		{"ASCII dsml", model.ChatTurn{Role: "assistant", Content: `<dsml>call search_kb with {...}</dsml>`}, true},
+		{"pipe dsml", model.ChatTurn{Role: "assistant", Content: `<|DSML|tool_calls>...</|DSML|tool_calls>`}, true},
+		{"fullwidth dsml", model.ChatTurn{Role: "assistant", Content: `<｜｜DSML｜｜ calls>...</｜｜DSML｜｜ calls>`}, true},
+		{"empty content", model.ChatTurn{Role: "assistant", Content: "   "}, true},
+		{"normal", model.ChatTurn{Role: "assistant", Content: "好的！给你出了 1 道题，请作答："}, false},
+		{"user kept", model.ChatTurn{Role: "user", Content: `<dsml>call...`}, false},
+	}
+	for _, c := range cases {
+		if got := isDirtyTurn(c.turn); got != c.want {
+			t.Errorf("%s: isDirtyTurn=%v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestLooksLikeSummary 总结意图关键词检测（扩大历史窗口用）。
+func TestLooksLikeSummary(t *testing.T) {
+	if !looksLikeSummary("我想结束今天的练习") {
+		t.Error("结束 should trigger summary window")
+	}
+	if !looksLikeSummary("帮我总结一下") {
+		t.Error("总结 should trigger summary window")
+	}
+	if !looksLikeSummary("今天学了什么，回顾一下") {
+		t.Error("回顾 should trigger summary window")
+	}
+	if looksLikeSummary("出一道古诗填空题") {
+		t.Error("普通出题不应触发总结窗口")
+	}
+}

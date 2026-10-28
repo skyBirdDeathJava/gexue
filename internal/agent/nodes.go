@@ -13,8 +13,12 @@ import (
 	"gexue/internal/repo"
 )
 
-// maxTurns 上下文携带的最近对话轮数。
-const maxTurns = 10
+// maxTurns 上下文携带的最近对话轮数（出题/判分/解答/追问共用）。
+// 20 轮：覆盖"一道题 10+ 轮还没结束"的边界（如一直要求提示），判分/解答不会因历史截断丢上下文。
+const maxTurns = 20
+
+// maxSummaryTurns 总结意图时加载的历史轮数（≈全部；上限防超长会话 token 爆炸）。
+const maxSummaryTurns = 200
 
 // noLLMFrame 未配置大模型时的友好提示帧（不 panic）。
 func (a *Agent) noLLMFrame(in ChatInput) *Frame {
@@ -74,17 +78,54 @@ func (a *Agent) checkKb(ctx context.Context, c *Ctx) error {
 
 // buildCtx 读最近 N 轮 ChatTurn，组装 LLM 上下文历史链（不含本轮 user 消息）。
 // 本轮消息由 Agent 作为 User 单独拼接；内部子调用与主循环共用同一份 History。
+// 过滤脏对话（DSML 泄漏 / 空内容）：避免修复前的失败轮次污染模型上下文。
 func (a *Agent) buildCtx(ctx context.Context, c *Ctx) error {
-	turns, err := c.tk.repo.ListTurns(ctx, c.Session.ID, maxTurns)
+	limit := maxTurns
+	if looksLikeSummary(c.In.Message) {
+		limit = maxSummaryTurns // 总结要看全程，不截断
+	}
+	turns, err := c.tk.repo.ListTurns(ctx, c.Session.ID, limit)
 	if err != nil {
 		return err
 	}
 	// ListTurns 按 id DESC，需反转回正序
 	c.History = make([]*schema.Message, 0, len(turns))
 	for i := len(turns) - 1; i >= 0; i-- {
+		if isDirtyTurn(turns[i]) {
+			continue // 脏对话不进上下文
+		}
 		c.History = append(c.History, &schema.Message{Role: schema.RoleType(turns[i].Role), Content: turns[i].Content})
 	}
 	return nil
+}
+
+// looksLikeSummary 结束/总结意图关键词检测（扩大历史窗口用；最终意图仍由路由 LLM 判定）。
+func looksLikeSummary(msg string) bool {
+	s := strings.ToLower(msg)
+	for _, k := range []string{"结束", "总结", "不想学", "完成了", "汇总", "回顾", "今天学了"} {
+		if strings.Contains(s, k) {
+			return true
+		}
+	}
+	return false
+}
+
+// isDirtyTurn 脏对话判定：assistant 内容含 DSML 标记（DeepSeek 内部标记语言泄漏）或为空。
+// user 消息是真实输入，一律保留。DSML 形态覆盖 ASCII/全角竖线：<dsml、<|dsml、｜｜dsml。
+func isDirtyTurn(t model.ChatTurn) bool {
+	if t.Role != "assistant" {
+		return false
+	}
+	content := strings.ToLower(strings.TrimSpace(t.Content))
+	if content == "" {
+		return true
+	}
+	for _, marker := range []string{"<dsml", "<|dsml", "｜｜dsml"} {
+		if strings.Contains(content, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // persist 落库：① 会话状态机（state / last_question_id）；② assistant ChatTurn。
