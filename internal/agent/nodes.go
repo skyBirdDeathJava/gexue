@@ -68,7 +68,7 @@ func (a *Agent) checkKb(ctx context.Context, c *Ctx) error {
 		subjectName = kb.Subject.Name
 		subjectCode = kb.Subject.Code
 	}
-	c.KB = &kbView{ID: kb.ID, GradeName: gradeName, SubjectName: subjectName, SubjectCode: subjectCode}
+	c.KB = &kbView{ID: kb.ID, SubjectID: kb.SubjectID, GradeID: kb.GradeID, GradeName: gradeName, SubjectName: subjectName, SubjectCode: subjectCode}
 	return nil
 }
 

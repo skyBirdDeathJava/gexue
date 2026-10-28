@@ -5,10 +5,14 @@ package main
 import (
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/joho/godotenv"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 
@@ -130,7 +134,8 @@ func main() {
 
 	// ---- 模拟测试 Agent ----
 	quizRepo := repo.NewQuizRepo(db)
-	quizAgent, err := agent.NewAgent(quizRepo, kbRepo, emb, retriever, agent.LLMConfig{
+	agentRepo := repo.NewAgentRepo(db)
+	quizAgent, err := agent.NewAgent(quizRepo, kbRepo, emb, retriever, agentRepo, agent.LLMConfig{
 		Provider: "deepseek",
 		APIKey:   cfg.LLM.DeepSeekV4APIKey,
 		BaseURL:  cfg.LLM.DeepSeekV4BaseURL,
@@ -178,13 +183,76 @@ func main() {
 	}
 }
 
+// initLogger 构建 zap 日志：控制台 + 按日期滚动的文件双写。
+// 文件：logs/gexue_YYYY-MM-DD.log，跨天自动切新文件；debug 级走人读格式，否则 JSON。
 func initLogger(cfg *config.Config) *zap.Logger {
+	var encoder zapcore.Encoder
+	var level zapcore.Level
 	if cfg.Log.Level == "debug" {
-		logger, _ := zap.NewDevelopment()
-		return logger
+		encoder = zapcore.NewConsoleEncoder(zap.NewDevelopmentEncoderConfig())
+		level = zapcore.DebugLevel
+	} else {
+		encoder = zapcore.NewJSONEncoder(zap.NewProductionEncoderConfig())
+		level = zapcore.InfoLevel
 	}
-	logger, _ := zap.NewProduction()
-	return logger
+
+	dir := "logs"
+	_ = os.MkdirAll(dir, 0o755)
+	syncer := zapcore.NewMultiWriteSyncer(zapcore.AddSync(os.Stderr), newDateFileWriter(dir))
+
+	core := zapcore.NewCore(encoder, syncer, level)
+	return zap.New(core, zap.AddCaller())
+}
+
+// dateFileWriter 按日期滚动的文件写入器：文件名 gexue_YYYY-MM-DD.log，跨天自动切新文件。
+type dateFileWriter struct {
+	mu  sync.Mutex
+	dir string
+	cur string   // 当前日期 key（YYYY-MM-DD）
+	f   *os.File
+}
+
+func newDateFileWriter(dir string) *dateFileWriter {
+	return &dateFileWriter{dir: dir}
+}
+
+// Write 跨天时关闭旧文件、打开当天的日志文件（zip-safety：每次写入持锁）。
+func (w *dateFileWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	date := time.Now().Format("2006-01-02")
+	if w.cur != date {
+		if w.f != nil {
+			w.f.Close()
+		}
+		f, err := os.OpenFile(filepath.Join(w.dir, "gexue_"+date+".log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			return 0, err
+		}
+		w.f, w.cur = f, date
+	}
+	return w.f.Write(p)
+}
+
+func (w *dateFileWriter) Sync() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.f != nil {
+		return w.f.Sync()
+	}
+	return nil
+}
+
+func (w *dateFileWriter) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.f != nil {
+		err := w.f.Close()
+		w.f = nil
+		return err
+	}
+	return nil
 }
 
 func initDB(cfg *config.Config, logger *zap.Logger) *gorm.DB {

@@ -34,6 +34,8 @@ type llmQuestion struct {
 // toolSearchKbArgs search_kb 参数。
 type toolSearchKbArgs struct {
 	KnowledgePoint string `json:"knowledge_point" jsonschema:"description=the knowledge point or query to search"`
+	Query          string `json:"query,omitempty" jsonschema:"description=检索关键词（knowledge_point 的别名，二选一）"`
+	Keyword        string `json:"keyword,omitempty" jsonschema:"description=检索关键词（knowledge_point 的别名，DSML 转换场景下模型可能用 keyword）"`
 	TopK           int    `json:"top_k,omitempty" jsonschema:"description=number of chunks to retrieve"`
 }
 
@@ -105,6 +107,12 @@ func (a *Agent) toolSearchKb(ctx context.Context, c *Ctx, argsJSON string) strin
 		return errMsg
 	}
 	kp := strings.TrimSpace(args.KnowledgePoint)
+	if kp == "" {
+		kp = strings.TrimSpace(args.Query) // query 别名
+	}
+	if kp == "" {
+		kp = strings.TrimSpace(args.Keyword) // keyword 别名（DSML 转换场景模型可能用 keyword）
+	}
 	if kp == "" {
 		return "缺少 knowledge_point（要检索的知识点）。"
 	}

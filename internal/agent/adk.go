@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 
 	extopenai "github.com/cloudwego/eino-ext/components/model/openai"
 	"github.com/cloudwego/eino/adk"
@@ -13,6 +14,8 @@ import (
 	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/schema"
 	"go.uber.org/zap"
+
+	imodel "gexue/internal/model"
 )
 
 // buildChatModel 构建 OpenAI 兼容 ChatModel（DeepSeek V4 / 方舟，均 OpenAI 兼容）。
@@ -53,12 +56,17 @@ type toolDef struct {
 type toolAdapter struct {
 	info *schema.ToolInfo
 	run  toolHandler
+	log  *zap.Logger // 诊断：无条件记录工具是否被 ADK 调用（不受 Ctx 是否有 nil 影响）
 }
 
 func (t *toolAdapter) Info(context.Context) (*schema.ToolInfo, error) { return t.info, nil }
 
 func (t *toolAdapter) InvokableRun(ctx context.Context, argsJSON string, _ ...tool.Option) (string, error) {
 	c := cFromCtx(ctx)
+	// 诊断：无条件记录 ADK 是否真的调到了工具（不受 Ctx 是否为 nil 影响）
+	if t.log != nil {
+		t.log.Warn("tool invoked", zap.String("tool", t.info.Name), zap.String("args", truncateTrace(argsJSON, 120)))
+	}
 	result := t.run(ctx, c, argsJSON)
 	// 工具级 trace：记录专家内部每次原子工具调用（名/参数/结果），随 persist 落库到 tool_calls/tool_results
 	if c != nil {
@@ -89,130 +97,180 @@ func (a *Agent) toolDefs() []toolDef {
 	return defs
 }
 
+// toolDefsByName 工具名 → toolDef 映射（agentRegistry 按 bindtools 字符串解析工具用）。
+func (a *Agent) toolDefsByName() map[string]toolDef {
+	defs := a.toolDefs()
+	m := make(map[string]toolDef, len(defs))
+	for _, d := range defs {
+		m[d.info.Name] = d
+	}
+	return m
+}
+
 // toolInfos 仅返回 ToolInfo 列表（供序列化校验等）。
 func (a *Agent) toolInfos() []*schema.ToolInfo {
 	infos, _ := a.toolInfosAndHandlers()
 	return infos
 }
 
-// subjectRouter 学科路由：subjectCode（math/yuwen/english/default）→ 路由 ChatModelAgent。
-// 学科由会话 KB 确定性决定，路由 Agent 只做意图识别（选择调用哪个专家）。
-type subjectRouter struct {
-	agents map[string]adk.Agent
+// agentScope 动态 agent 的加载键：学科 + 年级。
+type agentScope struct {
+	subjectID uint
+	gradeID   uint
 }
 
-func (r *subjectRouter) resolve(code string) adk.Agent {
-	if ag, ok := r.agents[code]; ok {
-		return ag
-	}
-	return r.agents["default"]
+// agentRegistry 按 (学科, 年级) 从 DB 懒加载并缓存构建的 ADK agent 树（1 路由 + 专家子 agent）。
+// 年级差异（题型/知识点/判分逻辑）落在 agent 行的 prompt 上，故每个 scope 是独立的树。
+// transfer 单父约束：每个 scope 的专家子 agent 均为独立实例（NewChatModelAgent 拷贝字段），
+// 缓存键 = scope，命中直接复用已构建的路由。
+// agentLister agent_config 表查询（*repo.AgentRepo 实现；测试可注入假实现）。
+type agentLister interface {
+	ListByScope(ctx context.Context, subjectID, gradeID uint) ([]*imodel.Agent, error)
 }
 
-// subjectNames 学科 code → 中文名（路由 Instruction 用）。
-var subjectNames = map[string]string{
-	"math":    "数学",
-	"yuwen":   "语文",
-	"english": "英语",
+type agentRegistry struct {
+	lister    agentLister
+	llm       model.ChatModel    // 全局默认模型（agent 行未指定 model 时用）
+	defByName map[string]toolDef // 工具注册表（bindtools 字符串 → toolAdapter）
+	cache     map[agentScope]adk.Agent
+	mu        sync.Mutex
+	log       *zap.Logger // 诊断
 }
 
-// expertSpec 专家 Agent 规格：一个专家 = 一个职责 + 若干工具。
-type expertSpec struct {
-	name        string
-	desc        string
-	instruction string
-	tools       []string // 工具名（toolDefs 里注册）
-}
-
-// buildExpertConfigs 从 expertSpecs 解析工具，生成 5 个专家配置模板（跨学科共享）。
-// 工具 handler 从 Ctx.tk 读取领域依赖，故这里只需登记 handler 引用，不持有基础设施。
-func (a *Agent) buildExpertConfigs() error {
-	defs := a.toolDefs()
-	defByName := make(map[string]toolDef, len(defs))
-	for _, d := range defs {
-		defByName[d.info.Name] = d
-	}
-
-	a.experts = make([]*adk.ChatModelAgentConfig, 0, len(expertSpecs))
-	for _, spec := range expertSpecs {
-		tools := make([]tool.BaseTool, 0, len(spec.tools))
-		for _, tn := range spec.tools {
-			d, ok := defByName[tn]
-			if !ok {
-				return fmt.Errorf("expert %s: unknown tool %s", spec.name, tn)
-			}
-			tools = append(tools, &toolAdapter{info: d.info, run: d.run})
+// resolve 返回某学科+年级的路由 agent（懒构建 + 缓存）；scope 未配置（无路由行）时返回 (nil, nil)。
+func (r *agentRegistry) resolve(ctx context.Context, subjectID, gradeID uint) (adk.Agent, error) {
+	key := agentScope{subjectID: subjectID, gradeID: gradeID}
+	r.mu.Lock()
+	ag, ok := r.cache[key]
+	r.mu.Unlock()
+	if ok {
+		if r.log != nil {
+			r.log.Warn("registry cache hit", zap.Uint64("subject", uint64(subjectID)), zap.Uint64("grade", uint64(gradeID)))
 		}
-		a.experts = append(a.experts, &adk.ChatModelAgentConfig{
-			Name:        spec.name,
-			Description: spec.desc,
-			Instruction: spec.instruction,
-			Model:       a.Model,
-			ToolsConfig: adk.ToolsConfig{
-				ToolsNodeConfig: compose.ToolsNodeConfig{Tools: tools},
-			},
-			MaxIterations: maxAgentIterations,
-		})
+		return ag, nil
 	}
-	return nil
-}
 
-// buildRouter 构建每学科一个路由 Agent（transfer 编排）。
-// transfer 约束：一个专家只能挂在一个父 agent 下（OnSetAsSubAgent 单父校验），
-// 故每个路由用共享的专家配置模板各自 NewChatModelAgent 建专属实例（NewChatModelAgent 会拷贝字段，不改模板）。
-// 路由系统提示词里的专家清单（名字+desc）由 ADK 依据子 agent 自动注入。
-func (a *Agent) buildRouter(ctx context.Context) error {
-	agents := make(map[string]adk.Agent, len(subjectNames)+1)
-	for code, name := range subjectNames {
-		router, err := a.newRouterAgent(ctx, code, name)
-		if err != nil {
-			return err
-		}
-		agents[code] = router
-	}
-	// default 路由（未知学科兜底）
-	defRouter, err := a.newRouterAgent(ctx, "default", "学习")
+	rows, err := r.lister.ListByScope(ctx, subjectID, gradeID)
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("list agents scope(%d,%d): %w", subjectID, gradeID, err)
 	}
-	agents["default"] = defRouter
+	if r.log != nil {
+		r.log.Warn("registry building", zap.Uint64("subject", uint64(subjectID)), zap.Uint64("grade", uint64(gradeID)), zap.Int("rows", len(rows)))
+	}
 
-	a.router = &subjectRouter{agents: agents}
-	return nil
-}
-
-// newRouterAgent 构建某学科的路由 Agent：从嵌入的路由配置模板派生（Name/Description/Instruction 按学科覆盖），
-// 经 transfer_to_agent 移交给对应专家子 agent。路由自身不带工具。
-// 专家经 AgentWithOptions(WithDisallowTransferToParent) 挂为子 agent，禁止回传父路由，保证单向分发。
-func (a *Agent) newRouterAgent(ctx context.Context, code, name string) (adk.Agent, error) {
-	routerCfg := *a.ChatModelAgentConfig // 拷贝模板，按学科派生
-	routerCfg.Name = code + "_router"
-	routerCfg.Description = name + "辅导路由：识别学生意图，派发出题/判分/追问/解题/总结专家"
-	routerCfg.Instruction = routerInstruction(name)
-	router, err := adk.NewChatModelAgent(ctx, &routerCfg)
+	fa, err := r.build(ctx, rows)
 	if err != nil {
 		return nil, err
 	}
+	if fa == nil {
+		return nil, nil // scope 未配置
+	}
 
-	// 每个路由自建专属专家实例（transfer 单父约束）；共享配置模板，NewChatModelAgent 会拷贝字段
-	subs := make([]adk.Agent, 0, len(a.experts))
-	for _, cfg := range a.experts {
+	r.mu.Lock()
+	r.cache[key] = fa
+	r.mu.Unlock()
+	return fa, nil
+}
+
+// build 由 DB 行构建一棵 ADK agent 树：路由行 + 其下的专家子 agent（按 parent_id 归属；当前每 scope 一树，按 agent_type 分组即可）。
+func (r *agentRegistry) build(ctx context.Context, rows []*imodel.Agent) (adk.Agent, error) {
+	var routerRow *imodel.Agent
+	expertRows := make([]*imodel.Agent, 0, 5)
+	for _, row := range rows {
+		switch row.AgentType {
+		case "router":
+			routerRow = row
+		case "expert":
+			expertRows = append(expertRows, row)
+		}
+	}
+	if routerRow == nil {
+		return nil, nil
+	}
+
+	routerCfg, err := r.agentConfig(routerRow)
+	if err != nil {
+		return nil, fmt.Errorf("router %s: %w", routerRow.Name, err)
+	}
+	router, err := adk.NewChatModelAgent(ctx, routerCfg)
+	if err != nil {
+		return nil, fmt.Errorf("build router %s: %w", routerRow.Name, err)
+	}
+
+	subs := make([]adk.Agent, 0, len(expertRows))
+	for _, row := range expertRows {
+		cfg, err := r.agentConfig(row)
+		if err != nil {
+			return nil, fmt.Errorf("agent %s: %w", row.Name, err)
+		}
 		ag, err := adk.NewChatModelAgent(ctx, cfg)
 		if err != nil {
-			return nil, fmt.Errorf("build expert %s: %w", cfg.Name, err)
+			return nil, fmt.Errorf("build expert %s: %w", row.Name, err)
 		}
 		subs = append(subs, adk.AgentWithOptions(ctx, ag, adk.WithDisallowTransferToParent()))
 	}
 
 	fa, err := adk.SetSubAgents(ctx, router, subs)
 	if err != nil {
-		return nil, fmt.Errorf("set sub-agents for router %s: %w", code, err)
+		return nil, fmt.Errorf("set sub-agents for router %s: %w", routerRow.Name, err)
 	}
 	return fa, nil
+}
+
+// toolCallInstruction 追加到每个 agent 的 Instruction 末尾：约束模型用结构化 tool_calls 调用工具。
+// 部分 DeepSeek 模型（如 deepseek-v4-flash）默认用 DSML 标记（<|DSML|invoke...>）表达工具调用，
+// 而 ADK 只认结构化 tool_calls —— DSML 会被当纯文本输出，工具不执行。统一在此压制。
+const toolCallInstruction = "\n\n【工具调用】调用工具必须走 function calling（结构化 tool_calls，返回函数名与 JSON 参数），严禁输出 <|DSML|...|> 或任何尖括号标记语言；需要调用工具时直接以函数调用形式返回，不要用标记文本表达。"
+
+// agentConfig 把 DB 行转成 adk.ChatModelAgentConfig。
+// bindtools 为逗号分隔的工具名，解析成 toolAdapter（工具 handler 从 Ctx.tk 读领域依赖）。
+func (r *agentRegistry) agentConfig(row *imodel.Agent) (*adk.ChatModelAgentConfig, error) {
+	cfg := &adk.ChatModelAgentConfig{
+		Name:          row.Name,
+		Description:   row.Description,
+		Instruction:   row.Prompt + toolCallInstruction,
+		Model:         r.llm,
+		MaxIterations: maxAgentIterations,
+	}
+	if row.MaxIterations > 0 {
+		cfg.MaxIterations = row.MaxIterations
+	}
+	if row.BindTools != "" {
+		tools, err := r.buildTools(row)
+		if err != nil {
+			return nil, err
+		}
+		cfg.ToolsConfig = adk.ToolsConfig{
+			ToolsNodeConfig: compose.ToolsNodeConfig{Tools: tools},
+		}
+	}
+	return cfg, nil
+}
+
+// buildTools 由 bindtools 解析出 toolAdapter 列表（诊断：记录每个专家的工具注册数）。
+func (r *agentRegistry) buildTools(row *imodel.Agent) ([]tool.BaseTool, error) {
+	if row.BindTools == "" {
+		return nil, nil
+	}
+	tools := make([]tool.BaseTool, 0, 3)
+	for _, tn := range strings.Split(row.BindTools, ",") {
+		tn = strings.TrimSpace(tn)
+		d, ok := r.defByName[tn]
+		if !ok {
+			return nil, fmt.Errorf("agent %s: unknown tool %s", row.Name, tn)
+		}
+		tools = append(tools, &toolAdapter{info: d.info, run: d.run, log: r.log})
+	}
+	if r.log != nil {
+		r.log.Warn("expert tools registered", zap.String("agent", row.Name), zap.Int("count", len(tools)))
+	}
+	return tools, nil
 }
 
 // streamRouter 运行路由 Agent（流式）。路由/专家的自由文本以 delta 帧实时推送到 out；
 // 结构性帧（question_list/feedback/...）由工具经 Ctx.emit（frame sink）实时推送。
 // 返回最终完整自由文本（供收尾与持久化）。
+// 流式开启：dsmlAwareModel 只在 DSML 开头才缓冲转换，正常文本原样透传，保留 token 级流式。
 func (a *Agent) streamRouter(ctx context.Context, c *Ctx, router adk.Agent, msgs []*schema.Message, out chan<- *Frame) string {
 	routerName := router.Name(ctx)
 	iter := router.Run(ctx, &adk.AgentInput{Messages: msgs, EnableStreaming: true})
@@ -231,6 +289,15 @@ func (a *Agent) streamRouter(ctx context.Context, c *Ctx, router adk.Agent, msgs
 		}
 		mv := ev.Output.MessageOutput
 		if mv.Role == schema.Tool {
+			// 诊断：记录专家子 agent 的工具事件（确认工具是否真的执行 + 结果）
+			if ev.AgentName != routerName && c.tk != nil && c.tk.log != nil {
+				if content, _ := mv.GetMessage(); content != nil {
+					c.tk.log.Warn("expert tool event",
+						zap.String("agent", ev.AgentName),
+						zap.String("tool", mv.ToolName),
+						zap.String("result", truncateTrace(content.Content, 200)))
+				}
+			}
 			if ev.AgentName == routerName {
 				a.recordToolEvent(c, mv)
 			} else if c.AgentIntent == "" && ev.AgentName != "" {

@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/cloudwego/eino/adk"
+	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
 	"go.uber.org/zap"
 
@@ -76,16 +77,14 @@ type LLMConfig struct {
 	Model    string
 }
 
-// Agent 对话式辅导 Agent：对照 adk.ChatModelAgentConfig 定义（ADK 词汇）。
-// 路由 Agent 按会话学科（kb.Subject.Code）确定性选中，做意图识别；出题/判分/追问/解题/总结
-// 各为专家子 agent（transfer）。专家用原子工具（检索/取题/落库展示）编排，内容由专家自己的
-// ReAct 循环产出，工具内不再调用 LLM。领域依赖（repo/kbRepo/emb/retriever/log）收拢进
-// toolkit，经每请求的 Ctx.tk 供工具读取，不在 Agent 上平铺。
+// Agent 对话式辅导 Agent：ADK 多 Agent，按 (学科, 年级) 从 DB 动态加载 agent 树。
+// 每个学科+年级 = 1 个路由 Agent + 5 个专家子 agent（generate/answer/followup/help/summarize），
+// 提示词（题型/知识点/判分逻辑）按年级差异化，存于 agent_config 表，经 agentRegistry 懒加载 + 缓存。
+// 领域依赖（repo/kbRepo/emb/retriever/log）收拢进 toolkit，经每请求的 Ctx.tk 供工具读取。
 type Agent struct {
-	*adk.ChatModelAgentConfig                             // 路由 Agent 配置模板（Model/MaxIterations；Name/Instruction 按学科派生）
-	experts                   []*adk.ChatModelAgentConfig // 5 个专家配置（工具已解析好，跨学科共享模板）
-	router                    *subjectRouter              // 构建好的 4 学科路由 map（运行层）；nil 时 no_llm 兜底
-	tk                        *toolkit                    // 领域依赖，用于 seed 每请求 Ctx
+	llm      model.ChatModel   // 全局默认模型（agent 行未指定 model 时用）；nil 时 no_llm 兜底
+	registry *agentRegistry    // 按 (学科,年级) 懒加载的 ADK agent 树（路由 + 专家）
+	tk       *toolkit          // 领域依赖，用于 seed 每请求 Ctx
 }
 
 // toolkit 领域依赖：工具的原子能力 + 会话流（checkKb/buildCtx/persist）所需的数据访问。
@@ -102,16 +101,11 @@ type toolkit struct {
 // 返回串仅作 LLM 继续决策的上下文，不直接展示给学生（学生看到的是 Frame）。
 type toolHandler func(ctx context.Context, c *Ctx, argsJSON string) string
 
-// NewAgent 构造 Agent；llmCfg.APIKey 为空时 Model 置 nil（无 key 可编译可测试，入口兜底）。
+// NewAgent 构造 Agent；llmCfg.APIKey 为空时 llm 置 nil（无 key 可编译可测试，入口兜底）。
 // retriever 可为 nil（未注入时 embSearchRaw 回退旧向量检索）。
-func NewAgent(qr *repo.QuizRepo, kr *repo.KnowledgeRepo, emb embedding.Embedder, retriever *retrieval.Retriever, llmCfg LLMConfig, log *zap.Logger) (*Agent, error) {
+// agentRepo 提供 agent_config 表查询（动态加载各学科+年级的 agent 树）。
+func NewAgent(qr *repo.QuizRepo, kr *repo.KnowledgeRepo, emb embedding.Embedder, retriever *retrieval.Retriever, agentRepo *repo.AgentRepo, llmCfg LLMConfig, log *zap.Logger) (*Agent, error) {
 	a := &Agent{
-		ChatModelAgentConfig: &adk.ChatModelAgentConfig{
-			Name:          "default_router",
-			Description:   "学习辅导路由：识别学生意图，派发出题/判分/追问/解题/总结专家",
-			Instruction:   routerInstruction("学习"),
-			MaxIterations: maxAgentIterations,
-		},
 		tk: &toolkit{repo: qr, kbRepo: kr, emb: emb, retriever: retriever, log: log},
 	}
 
@@ -120,16 +114,18 @@ func NewAgent(qr *repo.QuizRepo, kr *repo.KnowledgeRepo, emb embedding.Embedder,
 		if err != nil {
 			return nil, fmt.Errorf("init chat model: %w", err)
 		}
-		a.Model = cm
+		// 包一层 DSML 转换器：deepseek 等模型默认用 DSML 标记表达工具调用，ADK 只认结构化 tool_calls。
+		a.llm = &dsmlAwareModel{inner: cm, log: log}
 	}
 
-	// 构建 ADK 路由（专家配置 + 每学科路由）；无 LLM 时跳过，入口走 no_llm 兜底。
-	if a.Model != nil {
-		if err := a.buildExpertConfigs(); err != nil {
-			return nil, fmt.Errorf("build expert configs: %w", err)
-		}
-		if err := a.buildRouter(context.Background()); err != nil {
-			return nil, fmt.Errorf("build router: %w", err)
+	// 动态 agent 注册表（按 (学科,年级) 懒加载 + 缓存）；无 LLM 时跳过，入口走 no_llm 兜底。
+	if a.llm != nil {
+		a.registry = &agentRegistry{
+			lister:    agentRepo,
+			llm:       a.llm,
+			defByName: a.toolDefsByName(),
+			cache:     make(map[agentScope]adk.Agent),
+			log:       log,
 		}
 	}
 	return a, nil
@@ -159,16 +155,29 @@ func (a *Agent) ChatStream(ctx context.Context, in ChatInput) (<-chan *Frame, er
 		return nil, err
 	}
 
-	// ③ 无 LLM / 无路由兜底
-	if a.Model == nil || a.router == nil {
+	// ③ 无 LLM 兜底
+	if a.llm == nil {
 		c.emit(a.noLLMFrame(in))
 		a.persist(ctx, c)
 		close(out)
 		return out, nil
 	}
 
-	// ④ 学科路由 Agent（goroutine 内消费事件 → 实时推帧）
-	router := a.router.resolve(c.KB.SubjectCode)
+	// ④ 动态加载该 (学科,年级) 的路由 agent（懒构建 + 缓存）；未配置时给友好提示
+	router, err := a.registry.resolve(ctx, c.KB.SubjectID, c.KB.GradeID)
+	if err != nil {
+		c.emit(&Frame{Intent: "chitchat", Kind: FrameChitChat, Text: "辅导配置加载失败，请稍后再试。"})
+		a.persist(ctx, c)
+		close(out)
+		return out, nil
+	}
+	if router == nil {
+		c.emit(&Frame{Intent: "chitchat", Kind: FrameChitChat, Text: "这个年级的语文辅导还没准备好，换个年级试试吧～"})
+		a.persist(ctx, c)
+		close(out)
+		return out, nil
+	}
+
 	msgs := a.runtimeMessages(c)
 	runCtx := withCtx(ctx, c)
 
@@ -257,6 +266,8 @@ func (c *Ctx) emit(f *Frame) {
 // kbView 知识库元信息（含年级/学科名/学科码，供 prompt 注入与路由选中）。
 type kbView struct {
 	ID          uint
+	SubjectID   uint
+	GradeID     uint
 	GradeName   string
 	SubjectName string
 	SubjectCode string
